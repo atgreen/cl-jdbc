@@ -5,13 +5,13 @@ databases, running on [OpenLDK](https://github.com/atgreen/openldk).
 
 JDBC is Java's database API, and almost every database ships a JDBC driver:
 PostgreSQL, MySQL, MariaDB, SQLite, Oracle, SQL Server, DB2, Snowflake, Trino,
-H2, and dozens more. With OpenLDK those drivers run inside SBCL in the same
-process and heap as your Lisp code — no JVM subprocess, no sockets, no
-serialization. `cl-jdbc` wraps it in an idiomatic Lisp API: you connect with a
-URL and query with Lisp data, and never see a Java method descriptor.
+H2, and dozens more. OpenLDK runs those drivers inside SBCL, in the same process
+and heap as your Lisp code, rather than in a separate JVM reached over a socket.
+`cl-jdbc` wraps the JDBC API in a Lisp one: you connect with a URL and work with
+Lisp values.
 
 ```lisp
-(ql:quickload :cl-jdbc)   ; or (asdf:load-system "cl-jdbc")
+(asdf:load-system "cl-jdbc")
 
 (jdbc:with-connection (c "jdbc:h2:mem:demo")
   (jdbc:execute c "create table users (id int primary key, name varchar, age int)")
@@ -29,12 +29,12 @@ driver is fetched and loaded for you (see [Drivers](#drivers)).
 
 ## Two ways to use it
 
-- **The native API** (`jdbc:` package) — the examples below. Small, direct, and
-  self-describing: `connect`, `query`, `execute`, `with-transaction`.
-- **A [cl-dbi](https://github.com/fukamachi/cl-dbi) driver** (`dbd-jdbc`) —
-  JDBC as a backend for Common Lisp's standard database interface, so code
-  written to cl-dbi (and the libraries on top of it, like Mito and sxql) can
-  reach any JDBC database. See [As a cl-dbi driver](#as-a-cl-dbi-driver).
+- **The native API** (`jdbc:` package), shown in the examples below:
+  `connect`, `query`, `execute`, `with-transaction`.
+- **A [cl-dbi](https://github.com/fukamachi/cl-dbi) driver** (`dbd-jdbc`): JDBC
+  as a backend for Common Lisp's standard database interface, so code written to
+  cl-dbi (and the libraries on top of it, like Mito and sxql) can reach any JDBC
+  database. See [As a cl-dbi driver](#as-a-cl-dbi-driver).
 
 ## Requirements
 
@@ -49,8 +49,8 @@ driver is fetched and loaded for you (see [Drivers](#drivers)).
 The JDBC API itself (`java.sql.*`) is part of the JDK, so it needs no jar. A
 database *driver* does: its jar carries the code that speaks the wire protocol.
 `cl-jdbc` keeps a registry of well-known drivers, so a connection URL alone is
-usually enough — the matching jar is downloaded from Maven Central the first
-time and cached by OpenLDK.
+usually enough; the matching jar is downloaded from Maven Central the first time
+and cached by OpenLDK.
 
 | Keyword        | URL looks like                       | Maven artifact                      |
 |----------------|--------------------------------------|-------------------------------------|
@@ -65,11 +65,11 @@ time and cached by OpenLDK.
 | `:snowflake`   | `jdbc:snowflake://acct.snowflakecomputing.com` | `net.snowflake:snowflake-jdbc` |
 | `:trino`       | `jdbc:trino://host:8080`             | `io.trino:trino-jdbc`               |
 
-cl-jdbc works with **pure-Java (type-4) JDBC drivers**, which is almost all of
-them — including every other driver in the table above. A driver that bundles a
-**native library** is the exception: `† :sqlite` (xerial `sqlite-jdbc`) ships a
-JNI `.so` it loads at connect time, and that does not work under OpenLDK yet
-(you get `No native library found …`). See [Status](#status).
+cl-jdbc works with pure-Java (type-4) JDBC drivers, which covers every other
+driver in the table above. SQLite's xerial `sqlite-jdbc` (`†`) is the exception:
+it bundles a JNI native library (`.so`) that it loads at connect time, and that
+does not work under OpenLDK yet (you get `No native library found`). See
+[Status](#status).
 
 The driver is chosen from the URL's subprotocol (the token between the first two
 colons). Override it with `:driver`, teach `cl-jdbc` a new one with
@@ -127,7 +127,7 @@ escaped by the driver rather than spliced into the SQL.
 Parameters map from Lisp to JDBC following the cl-postgres/Postmodern
 convention: `t` → boolean true, `nil` → boolean **false**, `:null` → SQL
 `NULL`, a string → varchar, an integer → bigint, a real → double; any other
-value is passed through as a Java object. Note that `nil` is false, not NULL —
+value is passed through as a Java object. Note that `nil` is false, not NULL:
 bind SQL `NULL` with the keyword `:null`.
 
 Results map back: `NULL` → `nil`, strings → strings, booleans → `t`/`nil`,
@@ -151,27 +151,31 @@ the de-facto standard database-independent interface for Common Lisp. Load
   (dbi:do-sql conn "create table t (id int primary key, name varchar)")
   (dbi:do-sql conn "insert into t values (?, ?)" (list 1 "one"))
   (let ((query (dbi:execute (dbi:prepare conn "select * from t where id = ?") (list 1))))
-    (dbi:fetch-all query)))   ; => ((:|ID| 1 :|NAME| "one"))
+    (dbi:fetch-all query)))   ; => ((:|id| 1 :|name| "one"))
 ```
 
-Because cl-dbi is the common substrate, this also brings JDBC databases to the
-libraries built on it — the [Mito](https://github.com/fukamachi/mito) ORM, the
-[sxql](https://github.com/fukamachi/sxql) query builder, and more. Pass
-credentials with `:username`/`:password`, extra driver settings with
-`:properties`, and force a driver with `:jdbc-driver` when the URL's subprotocol
-is not enough.
+cl-dbi interns the plist keys from the column labels the database returns, so
+their case follows the database (PostgreSQL lowercases, as above; H2 uppercases).
+Because cl-dbi is the common substrate, libraries built on it, such as the
+[Mito](https://github.com/fukamachi/mito) ORM and the
+[sxql](https://github.com/fukamachi/sxql) query builder, reach JDBC databases
+through it too. Pass credentials with `:username`/`:password`, extra driver
+settings with `:properties`, and force a driver with `:jdbc-driver` when the
+URL's subprotocol is not enough.
 
 ## Status
 
 Early. Connecting, parameterized queries and updates, result sets with Lisp
 type conversion, transactions, the driver registry with on-demand jar download,
-and the `dbd-jdbc` cl-dbi driver all work and are covered by tests
-(`asdf:test-system "cl-jdbc"` and `asdf:test-system "dbd-jdbc"`, which run
-against an in-memory H2 database). Prepared-statement reuse, batch execution,
-richer temporal and binary type mapping, generated-key retrieval, metadata
-introspection, and connection pooling are not wrapped yet. Drivers that load a
-native JNI library — notably SQLite's xerial `sqlite-jdbc` — do not work under
-OpenLDK yet; use a pure-Java (type-4) driver.
+and the `dbd-jdbc` cl-dbi driver all work and are covered by tests.
+`asdf:test-system "cl-jdbc"` and `asdf:test-system "dbd-jdbc"` run against an
+in-memory H2 database; `asdf:test-system "cl-jdbc/postgres-tests"` runs the same
+against a live PostgreSQL, skipping when none is reachable (see
+`tests/postgres-tests.lisp` for the container command). Not yet wrapped:
+prepared-statement reuse, batch execution, richer temporal and binary type
+mapping, generated-key retrieval, metadata introspection, and connection
+pooling. Drivers that load a native JNI library, such as SQLite's xerial
+`sqlite-jdbc`, do not work under OpenLDK yet; use a pure-Java (type-4) driver.
 
 ## Author
 
@@ -179,4 +183,10 @@ Anthony Green <green@moxielogic.com>
 
 ## License
 
-MIT. See the headers in each source file.
+cl-jdbc is distributed under the MIT license; see the headers in each source
+file.
+
+It runs on [OpenLDK](https://github.com/atgreen/openldk), which is distributed
+under the GNU General Public License, version 3 or later, with the Classpath
+exception (`GPL-3.0-or-later WITH Classpath-exception-2.0`). The JDBC drivers
+you load at runtime are each under their own licenses.
