@@ -5,8 +5,9 @@ databases, running on [OpenLDK](https://github.com/atgreen/openldk).
 
 JDBC is Java's database API, and almost every database ships a JDBC driver:
 PostgreSQL, MySQL, MariaDB, SQLite, Oracle, SQL Server, DB2, Snowflake, Trino,
-H2, and dozens more. OpenLDK runs those drivers inside SBCL, in the same process
-and heap as your Lisp code, rather than in a separate JVM reached over a socket.
+H2, and dozens more. OpenLDK transpiles those drivers' Java bytecode to Lisp
+code that SBCL compiles and runs natively, in the same process and heap as your
+own code, rather than running them on a separate JVM reached over a socket.
 `cl-jdbc` wraps the JDBC API in a Lisp one: you connect with a URL and work with
 Lisp values.
 
