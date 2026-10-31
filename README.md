@@ -58,12 +58,18 @@ time and cached by OpenLDK.
 | `:postgresql`  | `jdbc:postgresql://host/db`          | `org.postgresql:postgresql`         |
 | `:mysql`       | `jdbc:mysql://host/db`               | `com.mysql:mysql-connector-j`       |
 | `:mariadb`     | `jdbc:mariadb://host/db`             | `org.mariadb.jdbc:mariadb-java-client` |
-| `:sqlite`      | `jdbc:sqlite:/path/to.db`            | `org.xerial:sqlite-jdbc`            |
+| `:sqlite` †    | `jdbc:sqlite:/path/to.db`            | `org.xerial:sqlite-jdbc`            |
 | `:sqlserver`   | `jdbc:sqlserver://host;database=db`  | `com.microsoft.sqlserver:mssql-jdbc` |
 | `:oracle`      | `jdbc:oracle:thin:@host:1521/svc`    | `com.oracle.database.jdbc:ojdbc11`  |
 | `:db2`         | `jdbc:db2://host/db`                 | `com.ibm.db2:jcc`                   |
 | `:snowflake`   | `jdbc:snowflake://acct.snowflakecomputing.com` | `net.snowflake:snowflake-jdbc` |
 | `:trino`       | `jdbc:trino://host:8080`             | `io.trino:trino-jdbc`               |
+
+cl-jdbc works with **pure-Java (type-4) JDBC drivers**, which is almost all of
+them — including every other driver in the table above. A driver that bundles a
+**native library** is the exception: `† :sqlite` (xerial `sqlite-jdbc`) ships a
+JNI `.so` it loads at connect time, and that does not work under OpenLDK yet
+(you get `No native library found …`). See [Status](#status).
 
 The driver is chosen from the URL's subprotocol (the token between the first two
 colons). Override it with `:driver`, teach `cl-jdbc` a new one with
@@ -163,7 +169,13 @@ and the `dbd-jdbc` cl-dbi driver all work and are covered by tests
 (`asdf:test-system "cl-jdbc"` and `asdf:test-system "dbd-jdbc"`, which run
 against an in-memory H2 database). Prepared-statement reuse, batch execution,
 richer temporal and binary type mapping, generated-key retrieval, metadata
-introspection, and connection pooling are not wrapped yet.
+introspection, and connection pooling are not wrapped yet. Drivers that load a
+native JNI library — notably SQLite's xerial `sqlite-jdbc` — do not work under
+OpenLDK yet; use a pure-Java (type-4) driver.
+
+## Author
+
+Anthony Green <green@moxielogic.com>
 
 ## License
 
