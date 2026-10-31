@@ -1,0 +1,921 @@
+;;; -*- Mode: LISP; Syntax: COMMON-LISP; Package: OPENLDK; Base: 10 -*-
+;;;
+;;; Copyright (C) 2024, 2025, 2026  Anthony Green <green@moxielogic.com>
+;;;
+;;; SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+;;;
+;;; This file is part of OpenLDK.
+
+;;; OpenLDK is free software; you can redistribute it and/or modify it
+;;; under the terms of the GNU General Public License as published by
+;;; the Free Software Foundation; either version 3, or (at your
+;;; option) any later version.
+
+;;; OpenLDK is distributed in the hope that it will be useful, but
+;;; WITHOUT ANY WARRANTY; without even the implied warranty of
+;;; MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+;;; General Public License for more details.
+
+;;; You should have received a copy of the GNU General Public License
+;;; along with OpenLDK; see the file COPYING.  If not, please see
+;;; <http://www.gnu.org/licenses/>.
+
+;;; Linking this library statically or dynamically with other modules is
+;;; making a combined work based on this library.  Thus, the terms and
+;;; conditions of the GNU General Public License cover the whole
+;;; combination.
+
+;;; As a special exception, the copyright holders of this library give
+;;; you permission to link this library with independent modules to
+;;; produce an executable, regardless of the license terms of these
+;;; independent modules, and to copy and distribute the resulting
+;;; executable under terms of your choice, provided that you also
+;;; meet, for each linked independent module, the terms and conditions
+;;; of the license of that module.  An independent module is a module
+;;; which is not derived from or based on this library.  If you modify
+;;; this library, you may extend this exception to your version of the
+;;; library, but you are not obligated to do so.  If you do not wish
+;;; to do so, delete this exception statement from your version.
+
+(in-package :openldk)
+
+(defclass/std constant-class-reference ()
+  ((index)))
+(define-print-object/std constant-class-reference)
+
+(defclass/std constant-string-reference ()
+  ((index)))
+
+(defclass/std constant-value ()
+  ((value)))
+
+(defclass/std constant-double (constant-value) ())
+(defclass/std constant-float (constant-value) ())
+(defclass/std constant-int (constant-value) ())
+(defclass/std constant-long (constant-value) ())
+
+(defclass/std constant-invoke-dynamic ()
+  ((bootstrap-method-attr-index)
+   (name-and-type-index)))
+
+(define-print-object/std constant-invoke-dynamic)
+
+(defclass/std constant-dynamic ()
+  ((bootstrap-method-attr-index)
+   (name-and-type-index)))
+(define-print-object/std constant-dynamic)
+
+(defclass/std constant-module-reference ()
+  ((name-index)))
+(define-print-object/std constant-module-reference)
+
+(defclass/std constant-package-reference ()
+  ((name-index)))
+(define-print-object/std constant-package-reference)
+
+(defclass/std constant-method-handle ()
+  ((reference-kind)
+   (reference-index)))
+
+(define-print-object/std constant-method-handle)
+
+(defun %emit-or-missing-class (emit-function)
+  "The IR EMIT-FUNCTION returns for a constant; or, if a class the constant
+names isn't there, IR that throws NoClassDefFoundError when the constant is
+used.  A JVM resolves a method handle or method type constant only when an
+instruction uses it: Spring Data's SpringDataWebConfiguration creates a
+lambda over Jackson 2 classes behind a check that they are present."
+  (handler-case (funcall emit-function)
+    (|condition-java/lang/Throwable| (c)
+      (let* ((thrown (and (slot-boundp c '|objref|) (slot-value c '|objref|)))
+             (class-name (and thrown (symbol-name (class-name (class-of thrown))))))
+        ;; MethodType.fromMethodDescriptorString reports a missing class as
+        ;; a TypeNotPresentException.
+        (if (member class-name '("java/lang/ClassNotFoundException" "java/lang/NoClassDefFoundError"
+                                 "java/lang/TypeNotPresentException")
+                    :test #'equal)
+            (make-instance 'ir-object-literal
+                           :value `(%throw '|java/lang/NoClassDefFoundError|
+                                           ,(let ((message (if (slot-exists-p thrown '|typeName|)
+                                                               (slot-value thrown '|typeName|)
+                                                               (slot-value thrown '|detailMessage|))))
+                                              (and message (substitute #\. #\/ (lstring message))))))
+            (error c))))))
+
+(defmethod emit ((cmh constant-method-handle) cp)
+  (let ((*descriptor-loader* (or (%context-java-loader) *descriptor-loader*)))
+    (%emit-or-missing-class (lambda () (%emit-method-handle cmh cp)))))
+
+(defun %emit-method-handle (cmh cp)
+  (assert (classload "java/lang/invoke/MethodHandles$Lookup"))
+  (let* ((ref-kind (reference-kind cmh))
+         (m (aref cp (reference-index cmh)))
+         ;; Field-kind handles (getField/getStatic/putField/putStatic) reference a
+         ;; Fieldref, whose name-and-type slot is name-and-type-descriptor-index;
+         ;; method-kind handles reference a Methodref (method-descriptor-index).
+         (nat-index (if (typep m 'constant-field-reference)
+                        (name-and-type-descriptor-index m)
+                        (method-descriptor-index m)))
+         (refc (let ((class (ir-class-class (emit (aref cp (class-index m)) cp))))
+                 ;; A class that isn't there is a stub with no java.lang.Class.
+                 (or (ignore-errors (java-class class))
+                     (%throw '|java/lang/NoClassDefFoundError| (substitute #\. #\/ (name class))))))
+         (name (jstring (emit-name (aref cp nat-index) cp)))
+         ;; Only method-kind handles have a MethodType; a field descriptor (e.g. "I")
+         ;; is not a valid method descriptor, so skip it for field kinds (1-4).
+         (type (unless (member ref-kind '(1 2 3 4))
+                 (|java/lang/invoke/MethodType.fromMethodDescriptorString(Ljava/lang/String;Ljava/lang/ClassLoader;)Ljava/lang/invoke/MethodType;|
+                  (jstring (emit-type (aref cp nat-index) cp)) (%context-java-loader))))
+         ;; Select the appropriate Lookup method based on reference kind
+         ;; See JVM spec: REF_getField=1, REF_getStatic=2, REF_putField=3, REF_putStatic=4,
+         ;;               REF_invokeVirtual=5, REF_invokeStatic=6, REF_invokeSpecial=7,
+         ;;               REF_newInvokeSpecial=8, REF_invokeInterface=9
+         (lookup-method (case ref-kind
+                          (1 '|java/lang/invoke/MethodHandles$Lookup.findGetter(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;|)
+                          (2 '|java/lang/invoke/MethodHandles$Lookup.findStaticGetter(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;|)
+                          (3 '|java/lang/invoke/MethodHandles$Lookup.findSetter(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;|)
+                          (4 '|java/lang/invoke/MethodHandles$Lookup.findStaticSetter(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;|)
+                          (5 '|java/lang/invoke/MethodHandles$Lookup.findVirtual(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/invoke/MethodType;)Ljava/lang/invoke/MethodHandle;|)
+                          (6 '|java/lang/invoke/MethodHandles$Lookup.findStatic(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/invoke/MethodType;)Ljava/lang/invoke/MethodHandle;|)
+                          (7
+                           '|java/lang/invoke/MethodHandles$Lookup.findSpecial(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/invoke/MethodType;Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;|) ; lint:suppress max-line-length
+                          (8 '|java/lang/invoke/MethodHandles$Lookup.findConstructor(Ljava/lang/Class;Ljava/lang/invoke/MethodType;)Ljava/lang/invoke/MethodHandle;|)
+                          ;; interface methods use findVirtual
+                          (9 '|java/lang/invoke/MethodHandles$Lookup.findVirtual(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/invoke/MethodType;)Ljava/lang/invoke/MethodHandle;|)
+                          (t (internal-error "Unknown MethodHandle reference kind: ~A" ref-kind)))))
+    ;; A trusted Lookup, made directly: MethodHandles.lookup() finds its
+    ;; caller on the stack, and these forms run every time the constant does.
+    (make-instance 'ir-method-handle
+                   :reference-index (reference-index cmh)
+                   :value (case ref-kind
+                            ;; Field getters/setters take field type, not MethodType
+                            ((1 2 3 4)
+                             ;; For field handles the name-and-type's type slot is a
+                             ;; field descriptor (e.g. "I" or "Ljava/lang/String;");
+                             ;; turn it directly into the field-type Class.
+                             (let ((field-type (%bin-type-name-to-class (emit-type (aref cp nat-index) cp))))
+                               `(let ((lookup (%make-trusted-lookup)))
+                                  (,lookup-method lookup ,refc ,name ,field-type))))
+                            ;; findSpecial needs an extra parameter (caller class)
+                            (7 `(let ((lookup (%make-trusted-lookup)))
+                                  (,lookup-method lookup ,refc ,name ,type ,refc)))
+                            ;; findConstructor doesn't take a name parameter
+                            (8 `(let ((lookup (%make-trusted-lookup)))
+                                  (,lookup-method lookup ,refc ,type)))
+                            ;; Standard method lookups (invokeVirtual, invokeStatic, invokeInterface)
+                            ((5 6 9) `(let ((lookup (%make-trusted-lookup)))
+                                        (,lookup-method lookup ,refc ,name ,type)))
+                            (t (internal-error "Unhandled MethodHandle reference kind: ~A" ref-kind))))))
+
+(defclass/std constant-method-type ()
+  ((descriptor-index)))
+
+(define-print-object/std constant-method-type)
+
+(defmethod emit ((cmt constant-method-type) cp)
+  (assert (classload "java/lang/invoke/MethodType"))
+  (%emit-or-missing-class
+   (lambda ()
+     (let ((descriptor (emit (aref cp (descriptor-index cmt)) cp))
+           (*descriptor-loader* (or (%context-java-loader) *descriptor-loader*)))
+       (let ((mt (|java/lang/invoke/MethodType.methodType(Ljava/lang/Class;[Ljava/lang/Class;)Ljava/lang/invoke/MethodType;|
+                  (%get-return-type descriptor)
+                  (make-java-array
+                   :component-class (%get-java-class-by-bin-name "java/lang/Class")
+                   :initial-contents (%get-parameter-types descriptor)))))
+         (make-instance 'ir-object-literal
+                        :value mt))))))
+
+(defclass/std constant-field-reference ()
+  ((class-index
+    name-and-type-descriptor-index)))
+
+(defclass/std constant-method-reference ()
+  ((class-index
+    method-descriptor-index)))
+
+(defclass/std constant-interface-method-reference (constant-method-reference)
+  ())
+
+(defclass/std constant-name-and-type-descriptor ()
+  ((name-index
+    type-descriptor-index)))
+
+(defmethod emit ((v constant-string-reference) cp)
+  (make-instance 'ir-string-literal
+                 :value (format nil "~A" (emit (aref cp (slot-value v 'index)) cp))))
+
+(defmethod get-stack-jtype ((v constant-string-reference))
+  :REFERENCE)
+
+(defmethod emit ((v constant-float) cp)
+  (make-instance 'ir-float-literal :value (slot-value v 'value)))
+
+(defmethod get-stack-jtype ((v constant-float))
+  :FLOAT)
+
+(defmethod emit ((v constant-double) cp)
+  (make-instance 'ir-double-literal :value (slot-value v 'value)))
+
+(defmethod get-stack-jtype ((v constant-double))
+  :DOUBLE)
+
+(defmethod emit ((v constant-int) cp)
+  (make-instance 'ir-int-literal :value (slot-value v 'value)))
+
+(defmethod get-stack-jtype ((v constant-int))
+  :INTEGER)
+
+(defmethod emit ((v constant-long) cp)
+  (make-instance 'ir-long-literal :value (slot-value v 'value)))
+
+(defmethod get-stack-jtype ((v constant-long))
+  :LONG)
+
+(defmethod emit ((v constant-field-reference) cp)
+  (let ((class (emit (aref cp (slot-value v 'class-index)) cp)))
+    (values (emit-name (aref cp (slot-value v 'name-and-type-descriptor-index)) cp) class)))
+
+(defmethod emit-type ((v constant-field-reference) cp)
+  (let ((class (emit (aref cp (slot-value v 'class-index)) cp)))
+    (values (emit-type (aref cp (slot-value v 'name-and-type-descriptor-index)) cp) class)))
+
+(defmethod emit ((v ir-string-literal) cp)
+  "Return the string value from a UTF8 constant pool entry."
+  (declare (ignore cp))
+  (slot-value v 'value))
+
+(defmethod emit ((v constant-class-reference) cp)
+  (let ((classname (emit (aref cp (slot-value v 'index)) cp)))
+    (if (char= (aref classname 0) #\[)
+        ;; The component class is the compiled class's loader's to find.
+        (let ((*descriptor-loader* (or (%context-java-loader) *descriptor-loader*)))
+          (make-instance 'ir-class
+                         :class (%get-array-ldk-class-from-name classname)))
+        (let ((ldk-class (%resolve-class-in-context classname)))
+          (make-instance 'ir-class
+                         :class (or ldk-class
+                                    ;; Class not on classpath (e.g. AWT) — create a stub
+                                    ;; so downstream code can still read the name
+                                    (let ((stub (make-instance '<class>)))
+                                      (setf (name stub) classname)
+                                      stub)))))))
+
+(defmethod get-stack-jtype ((v constant-class-reference))
+  :REFERENCE)
+
+(defmethod get-stack-jtype ((v constant-method-handle))
+  :REFERENCE)
+
+(defmethod get-stack-jtype ((v constant-method-type))
+  :REFERENCE)
+
+(defmethod emit ((v constant-module-reference) cp)
+  (emit (aref cp (slot-value v 'name-index)) cp))
+
+(defmethod emit ((v constant-package-reference) cp)
+  (emit (aref cp (slot-value v 'name-index)) cp))
+
+(defmethod emit-name ((v constant-class-reference) cp)
+  (emit (aref cp (slot-value v 'index)) cp))
+
+(defmethod emit ((v constant-name-and-type-descriptor) cp)
+  (format nil "~A~A"
+          (emit (aref cp (slot-value v 'name-index)) cp)
+          (emit (aref cp (slot-value v 'type-descriptor-index)) cp)))
+
+(defmethod emit-name ((v constant-name-and-type-descriptor) cp)
+  (format nil "~A" (emit (aref cp (slot-value v 'name-index)) cp)))
+
+(defmethod emit-type ((v constant-name-and-type-descriptor) cp)
+  (format nil "~A" (emit (aref cp (slot-value v 'type-descriptor-index)) cp)))
+
+(defun emit-static-method-reference (v cp)
+  "Return the string name of a static method reference V using constant pool CP."
+  (let ((klass (ir-class-class (emit (aref cp (slot-value v 'class-index)) cp))))
+    (%resolve-class-in-context (name klass)))
+  (format nil "~A.~A"
+          (name (ir-class-class (emit (aref cp (slot-value v 'class-index)) cp)))
+          (lispize-method-name (emit (aref cp (slot-value v 'method-descriptor-index)) cp))))
+
+(defmethod emit ((v constant-method-reference) cp)
+  (format nil "~A"
+          (emit (aref cp (slot-value v 'method-descriptor-index)) cp)))
+
+(defun wrap-fast-read-sequence (vec buf &key (start 0) (end nil))
+  "Must wrap this so it has the same signature as clhs' READ-SEQUENCE."
+  (fast-io:fast-read-sequence vec buf start end))
+
+(defclass/std <class> ()
+  ((major-version
+    minor-version
+    initialized-p
+    initializing-p   ; <clinit> currently running (set before, cleared after)
+    init-error       ; what a failed <clinit> threw (a Throwable), or NIL
+    name
+    super
+    interfaces
+    constant-pool
+    raw-constant-pool
+    access-flags
+    fields
+    methods
+    inner-classes
+    nest-host
+    nest-members
+    attributes
+    java-class
+    method-name-table  ; lazy hash set of lispized name+descriptor strings
+    content-hash       ; MD5 of the classfile, hex, for the FASL cache
+    ldk-loader)  ; <ldk-class-loader> that loaded this class
+   (runtime-roots :std nil)
+   (static-instance :std nil)
+   (verified-p :std nil)
+   (verification-name :std nil)))
+
+(defclass/std <inner-class> ()
+  ((inner-class-info-index
+    outer-class-info-index
+    inner-name-index
+    inner-class-access-flags)))
+
+(defvar *no-attributes* (make-hash-table :test #'equal)
+  "The attributes of a class without a class file: none.")
+
+(defmethod attributes :around ((class <class>))
+  "A primitive or array type's class has no attributes table; reading one
+of its attributes finds none rather than failing."
+  (or (and (slot-boundp class 'attributes) (call-next-method))
+      *no-attributes*))
+
+(defmethod print-object ((class <class>) out)
+  (print-unreadable-object (class out :type t)
+    (format out "~A" (slot-value class 'name))))
+
+(defclass/std <field> ()
+  ((class :with)
+   (name)
+   (descriptor)
+   (access-flags :std 0)
+   (attributes)))
+
+(defclass/std <method> (<field>)
+  ((verified-p :std nil)))
+
+(defclass/std <bootstrap-method> ()
+  ((method-ref)
+   (method-args)))
+
+(define-print-object/std <bootstrap-method>)
+
+(define-print-object/std <method>)
+
+(defun interface-p (class)
+  "True if CLASS has the interface access flag."
+  (not (zerop (logand #x200 (slot-value class 'access-flags)))))
+
+(defun native-p (method)
+  "True if METHOD has the native access flag."
+  (not (zerop (logand #x100 (slot-value method 'access-flags)))))
+
+(defun static-p (method)
+  "True if METHOD has the static access flag."
+  (not (zerop (logand #x8 (slot-value method 'access-flags)))))
+
+(defun abstract-p (method)
+  "True if METHOD has the abstract access flag."
+  (not (zerop (logand #x400 (slot-value method 'access-flags)))))
+
+(defun synchronized-p (method)
+  "True if METHOD has the ACC_SYNCHRONIZED access flag."
+  (not (zerop (logand #x20 (slot-value method 'access-flags)))))
+
+(defun bridge-p (method)
+  "True if METHOD has the bridge access flag."
+  (not (zerop (logand #x40 (access-flags method)))))
+
+(defmethod print-object ((method <method>) out)
+  (print-unreadable-object (method out :type t)
+    (format out "~A.~A.~A" (slot-value method 'class) (slot-value method 'name) (slot-value method 'descriptor))))
+
+(defclass/std <code> ()
+  ((max-stack)
+   (max-locals)
+   (code)
+   (exceptions)
+   (attributes)))
+
+(defmacro read-u2 ()
+  "Read an unsigned 2-byte big-endian integer from BITIO."
+  `(bitio:read-integer bitio :num-bytes 2 :byte-endian :be :unsignedp t))
+
+(defmacro read-u4 ()
+  "Read an unsigned 4-byte big-endian integer from BITIO."
+  `(bitio:read-integer bitio :num-bytes 4 :byte-endian :be :unsignedp t))
+
+(defmacro read-u8 ()
+  "Read an unsigned 8-byte big-endian integer from BITIO."
+  `(bitio:read-integer bitio :num-bytes 8 :byte-endian :be :unsignedp t))
+
+(defvar *classfile-octet-limit* nil
+  "Maximum possible attribute size while parsing an in-memory classfile.")
+
+(defmacro read-buffer (size)
+  "Read SIZE octets, checking the input's bound before allocating storage."
+  (let ((count (gensym "COUNT")))
+    `(let ((,count ,size))
+       (when (and *classfile-octet-limit* (> ,count *classfile-octet-limit*))
+         (class-format-error "Attribute exceeds classfile length"))
+       (let ((buf (make-array ,count :element-type '(unsigned-byte 8))))
+         (bitio:read-bytes bitio buf :bit-endian :be :bits-per-byte 8)
+         buf))))
+
+(defclass/std <exception-table-entry> ()
+  ((start-pc)
+   (end-pc)
+   (handler-pc)
+   (catch-type)))
+
+(defmethod print-object ((ete <exception-table-entry>) out)
+  (print-unreadable-object (ete out :type t)
+    (with-slots (start-pc end-pc handler-pc) ete
+      (format out "(~A:~A]->~A" start-pc end-pc handler-pc))))
+
+(defun read-exceptions (bitio cp count)
+  "Read COUNT exception table entries from BITIO using constant pool CP."
+  (if (> count 0)
+      (let ((exceptions (make-array count)))
+        (dotimes (i count)
+          (setf (aref exceptions i)
+                (make-instance '<exception-table-entry>
+                               :start-pc (read-u2)
+                               :end-pc (read-u2)
+                               :handler-pc (read-u2)
+                               :catch-type (let ((i (read-u2)))
+                                             (if (zerop i)
+                                                 nil
+                                                 (emit-name (aref cp i) cp))))))
+        exceptions)
+      nil))
+
+(defun read-attributes (bitio constant-pool class count)
+  "Read COUNT attributes from a classfile for CLASS using the BITIO
+stream."
+  (let ((attributes (make-hash-table :test 'equal)))
+    (dotimes (i count)
+      (let* ((name-index (read-u2))
+             (name (slot-value (aref constant-pool name-index) 'value))
+             (attributes-length (read-u4)))
+        (switch (name :test 'string=)
+          ("BootstrapMethods"
+           (let ((num-bootstrap-methods (read-u2)))
+             (setf (gethash "BootstrapMethods" attributes)
+                   (loop for i below num-bootstrap-methods
+                         collect (let* ((bootstrap-method-ref (read-u2))
+                                        (num-bootstrap-arguments (read-u2))
+                                        (bootstrap-arguments (loop for i below num-bootstrap-arguments
+                                                                   collect (read-u2))))
+                                   (make-instance '<bootstrap-method>
+                                                  :method-ref bootstrap-method-ref
+                                                  :method-args bootstrap-arguments))))))
+          ("Code"
+           (when (gethash "Code" attributes) (class-format-error "Duplicate Code attribute"))
+           (let* ((max-stack (read-u2))
+                  (max-locals (read-u2))
+                  (code-length (read-u4))
+                  (code (progn
+                          (unless (< 0 code-length 65536) (class-format-error "Invalid Code length ~D" code-length))
+                          (read-buffer code-length)))
+                  (exception-table-length (read-u2))
+                  (exceptions (read-exceptions bitio constant-pool exception-table-length))
+                  (attribute-count (read-u2))
+                  (code-attributes (read-attributes bitio constant-pool class attribute-count)))
+             (setf (gethash "Code" attributes)
+                   (make-instance '<code>
+                                  :max-stack max-stack
+                                  :max-locals max-locals
+                                  :code code
+                                  :exceptions exceptions
+                                  :attributes code-attributes))))
+          ("ConstantValue"
+           (assert (= 2 attributes-length))
+           (setf (gethash "ConstantValue" attributes)
+                 (read-u2)))
+          ("Deprecated"
+           (read-buffer attributes-length))
+          ("EnclosingMethod"
+           ;; (class_index . method_index) -- method_index 0 means the class
+           ;; is enclosed by a field initializer or instance/static block.
+           (setf (gethash "EnclosingMethod" attributes)
+                 (cons (read-u2) (read-u2))))
+          ("Exceptions"
+           ;; number_of_exceptions u2, then that many CONSTANT_Class indices.
+           ;; Stored so Method/Constructor reflection can report declared
+           ;; checked exceptions (Method.toString()'s "throws" clause etc.).
+           (let ((count (read-u2)))
+             (setf (gethash "Exceptions" attributes)
+                   (loop repeat count collect (read-u2)))))
+          ("InnerClasses"
+           (let ((count (read-u2)))
+             (setf (gethash "InnerClasses" attributes)
+                   (loop for num below count
+                         collect (make-instance '<inner-class>
+                                                :inner-class-info-index (read-u2)
+                                                :outer-class-info-index (read-u2)
+                                                :inner-name-index (read-u2)
+                                                :inner-class-access-flags (read-u2))))))
+          ("LocalVariableTable"
+           (read-buffer attributes-length))
+          ("LocalVariableTypeTable"
+           (read-buffer attributes-length))
+          ("LineNumberTable"
+           (read-buffer attributes-length))
+          ("MethodParameters"
+           ;; (name . access-flags) per parameter, the name NIL when the
+           ;; class file leaves it out.  Executable.getParameters0 reports
+           ;; these; javac writes them with -parameters.
+           (let ((count (bitio:read-one-byte bitio)))
+             (setf (gethash "MethodParameters" attributes)
+                   (loop repeat count
+                         collect (let ((name-index (read-u2)))
+                                   (cons (unless (zerop name-index)
+                                           (slot-value (aref constant-pool name-index) 'value))
+                                         (read-u2)))))))
+          ("RuntimeInvisibleAnnotations"
+           (read-buffer attributes-length))
+          ("RuntimeInvisibleParameterAnnotations"
+           (read-buffer attributes-length))
+          ("RuntimeVisibleParameterAnnotations"
+           (setf (gethash "RuntimeVisibleParameterAnnotations" attributes)
+                 (make-java-array :component-class
+                                  (or (%get-java-class-by-bin-name "byte" t) :early-byte-placeholder)
+                                  :initial-contents (read-buffer attributes-length))))
+          ("RuntimeVisibleAnnotations"
+           (setf (gethash "RuntimeVisibleAnnotations" attributes)
+                 (make-java-array :component-class
+                                  (or (%get-java-class-by-bin-name "byte" t) :early-byte-placeholder)
+                                  :initial-contents (read-buffer attributes-length))))
+          ("AnnotationDefault"
+           (setf (gethash "AnnotationDefault" attributes)
+                 (make-java-array :component-class
+                                  (or (%get-java-class-by-bin-name "byte" t) :early-byte-placeholder)
+                                  :initial-contents (read-buffer attributes-length))))
+          ("StackMapTable"
+           (when (gethash name attributes)
+             (class-format-error "Duplicate StackMapTable attribute"))
+           (setf (gethash name attributes) (read-buffer attributes-length)))
+          ("SourceFile"
+           (read-buffer attributes-length))
+          ("SourceDebugExtension"
+           (read-buffer attributes-length))
+          ("Signature"
+           (setf (gethash "Signature" attributes)
+                 (slot-value (aref constant-pool (read-u2)) 'value)))
+          ("NestHost"
+           (setf (gethash "NestHost" attributes) (read-u2)))
+          ("NestMembers"
+           (let ((n (read-u2)))
+             (setf (gethash "NestMembers" attributes)
+                   (loop for i below n collect (read-u2)))))
+          ("Module"
+           (read-buffer attributes-length))
+          ("ModulePackages"
+           (read-buffer attributes-length))
+          ("ModuleMainClass"
+           (read-buffer attributes-length))
+          ("Record"
+           ;; (name descriptor attributes) per record component, for
+           ;; Class.getRecordComponents0.
+           (let ((count (read-u2)))
+             (setf (gethash "Record" attributes)
+                   (loop repeat count
+                         collect (let* ((name (slot-value (aref constant-pool (read-u2)) 'value))
+                                        (descriptor (slot-value (aref constant-pool (read-u2)) 'value)))
+                                   (list name descriptor
+                                         (read-attributes bitio constant-pool class (read-u2))))))))
+          ("PermittedSubclasses"
+           (when (nth-value 1 (gethash name attributes))
+             (class-format-error "Duplicate PermittedSubclasses attribute"))
+           (let ((count (read-u2)))
+             (unless (= attributes-length (+ 2 (* 2 count)))
+               (class-format-error "Invalid PermittedSubclasses attribute length"))
+             (setf (gethash name attributes)
+                   (loop repeat count
+                         for index = (read-u2)
+                         for entry = (and (< 0 index (length constant-pool)) (aref constant-pool index))
+                         do (unless (typep entry 'constant-class-reference)
+                              (class-format-error "Invalid permitted subclass constant"))
+                         collect (slot-value (aref constant-pool (slot-value entry 'index)) 'value)))))
+          ;; Kept, as RuntimeVisibleAnnotations is, for the reflective
+          ;; getAnnotated* methods (Spring reads JSpecify's @Nullable so).
+          ("RuntimeVisibleTypeAnnotations"
+           (setf (gethash "RuntimeVisibleTypeAnnotations" attributes)
+                 (make-java-array :component-class
+                                  (or (%get-java-class-by-bin-name "byte" t) :early-byte-placeholder)
+                                  :initial-contents (read-buffer attributes-length))))
+          ("RuntimeInvisibleTypeAnnotations"
+           (read-buffer attributes-length))
+          ;; The JVM ignores attributes it doesn't know, such as Scala's
+          ;; ScalaSig and ScalaInlineInfo.
+          (t
+           (read-buffer attributes-length)))))
+    attributes))
+
+(defun modified-utf8-to-utf8 (data)
+  "Convert a vector of bytes from Modified UTF-8 to standard UTF-8.
+   Handles both the null encoding (0xC0 0x80) and surrogate pairs for supplementary characters."
+  (let ((result (make-array 0 :element-type 'unsigned-byte :adjustable t :fill-pointer 0))
+        (i 0))
+    (loop while (< i (length data))
+          do (let ((byte (aref data i)))
+               (cond
+                 ;; Handle Modified UTF-8 null encoding: 0xC0 0x80 -> 0x00
+                 ((and (= byte #xC0)
+                       (< (1+ i) (length data))
+                       (= (aref data (1+ i)) #x80))
+                  (vector-push-extend 0 result)
+                  (incf i 2))
+
+                 ;; Handle surrogate pairs: 6-byte Modified UTF-8 -> 4-byte UTF-8
+                 ;; High surrogate: ED Ax Bx (where x = A-F)
+                 ;; Low surrogate:  ED Bx Bx (where x = 0-F)
+                 ((and (= byte #xED)
+                       (<= (+ i 5) (length data))
+                       (= (logand (aref data (1+ i)) #xF0) #xA0)  ; High surrogate marker
+                       (= (aref data (+ i 3)) #xED)
+                       (= (logand (aref data (+ i 4)) #xF0) #xB0)) ; Low surrogate marker
+                  ;; Decode the two surrogates
+                  (let* ((b1 (aref data (1+ i)))
+                         (b2 (aref data (+ i 2)))
+                         (b4 (aref data (+ i 4)))
+                         (b5 (aref data (+ i 5)))
+                         ;; Extract surrogate values
+                         (high-surrogate (logior #xD800 (ash (logand b1 #x0F) 6) (logand b2 #x3F)))
+                         (low-surrogate (logior #xDC00 (ash (logand b4 #x0F) 6) (logand b5 #x3F)))
+                         ;; Combine to get the codepoint
+                         (codepoint (+ #x10000
+                                      (ash (logand high-surrogate #x3FF) 10)
+                                      (logand low-surrogate #x3FF))))
+                    ;; Encode as proper 4-byte UTF-8
+                    (vector-push-extend (logior #xF0 (ash codepoint -18)) result)
+                    (vector-push-extend (logior #x80 (logand (ash codepoint -12) #x3F)) result)
+                    (vector-push-extend (logior #x80 (logand (ash codepoint -6) #x3F)) result)
+                    (vector-push-extend (logior #x80 (logand codepoint #x3F)) result)
+                    (incf i 6)))
+
+                 ;; Otherwise, copy the byte as-is
+                 (t
+                  (vector-push-extend byte result)
+                  (incf i)))))
+    result))
+
+(defun modified-utf8-to-string (data)
+  "Decode Java Modified UTF-8 bytes DATA directly to a Lisp string.
+
+Unlike routing the bytes through flexi-streams' UTF-8 decoder, this
+tolerates unpaired surrogates: a class file's CONSTANT_Utf8 may hold a
+lone surrogate (e.g. sun/nio/cs/StandardCharsets tables contain
+#xDE9A), which is a legal Java char but not a legal UTF-8 code point --
+flexi-streams signals 'Illegal code point' on it.  SBCL's CODE-CHAR
+accepts surrogate code points, so we build the string directly.
+
+Matches OpenLDK's code-point string convention (see STRINGS.LISP):
+surrogate PAIRS combine into one supplementary character (> #xFFFF);
+lone surrogates and other BMP characters map to one character each."
+  (let ((out (make-array (length data) :element-type 'character
+                                       :adjustable t :fill-pointer 0))
+        (n (length data))
+        (i 0))
+    (flet ((emit (code) (vector-push-extend (code-char code) out)))
+      (loop while (< i n)
+            do (let ((b (aref data i)))
+                 (cond
+                   ;; Modified UTF-8 NUL: 0xC0 0x80 -> U+0000
+                   ((and (= b #xC0) (< (1+ i) n) (= (aref data (1+ i)) #x80))
+                    (emit 0) (incf i 2))
+                   ;; 1-byte ASCII (0x01..0x7F)
+                   ((< b #x80) (emit b) (incf i))
+                   ;; 6-byte surrogate pair: ED Ax .. ED Bx -> supplementary
+                   ((and (= b #xED) (< (+ i 5) n)
+                         (= (logand (aref data (1+ i)) #xF0) #xA0)
+                         (= (aref data (+ i 3)) #xED)
+                         (= (logand (aref data (+ i 4)) #xF0) #xB0))
+                    (let ((hi (logior #xD800
+                                      (ash (logand (aref data (1+ i)) #x0F) 6)
+                                      (logand (aref data (+ i 2)) #x3F)))
+                          (lo (logior #xDC00
+                                      (ash (logand (aref data (+ i 4)) #x0F) 6)
+                                      (logand (aref data (+ i 5)) #x3F))))
+                      (emit (+ #x10000
+                               (ash (logand hi #x3FF) 10)
+                               (logand lo #x3FF)))
+                      (incf i 6)))
+                   ;; 3-byte (1110xxxx) -- includes lone surrogates
+                   ((and (= (logand b #xF0) #xE0) (< (+ i 2) n))
+                    (emit (logior (ash (logand b #x0F) 12)
+                                  (ash (logand (aref data (+ i 1)) #x3F) 6)
+                                  (logand (aref data (+ i 2)) #x3F)))
+                    (incf i 3))
+                   ;; 2-byte (110xxxxx)
+                   ((and (= (logand b #xE0) #xC0) (< (1+ i) n))
+                    (emit (logior (ash (logand b #x1F) 6)
+                                  (logand (aref data (1+ i)) #x3F)))
+                    (incf i 2))
+                   ;; Malformed/truncated -- pass the raw byte through.
+                   (t (emit b) (incf i))))))
+    (coerce out 'string)))
+
+(defun %read-all-octets (stream)
+  "The rest of binary STREAM's contents, as an octet vector."
+  (let ((out (fast-io:make-output-buffer))
+        (buffer (make-array 65536 :element-type '(unsigned-byte 8))))
+    (loop for end = (read-sequence buffer stream)
+          while (plusp end)
+          do (fast-io:fast-write-sequence buffer out 0 end))
+    (fast-io:finish-output-buffer out)))
+
+(defun %read-classfile (fin)
+  "Parse a classfile from binary input stream FIN and return a <class>."
+  (let* ((class (make-instance '<class>))
+         (octets (%read-all-octets fin))
+         (*classfile-octet-limit* (length octets)))
+    ;; The FASL cache keys compiled methods by their class's content.
+    (setf (slot-value class 'content-hash) (%md5-hex octets))
+    (with-slots (methods fields super interfaces) class
+      (fast-io:with-fast-input (fin-fast octets)
+        (let ((bitio (bitio:make-bitio fin-fast #'fast-io:fast-read-byte #'wrap-fast-read-sequence)))
+          (flet ((read-u1 () (bitio:read-one-byte bitio)))
+            (unless (= (read-u4) #xcafebabe)
+              (class-format-error "Invalid classfile magic"))
+            (let ((minor-version (read-u2))
+                  (major-version (read-u2)))
+              (when (or (< major-version 45) (> major-version 69)
+                        (and (>= major-version 56) (not (zerop minor-version))
+                             (not (and *enable-preview* (= major-version 69)
+                                       (= minor-version 65535)))))
+                ;; Java-visible: the JVM throws UnsupportedClassVersionError.
+                (let ((exc (%make-java-instance "java/lang/UnsupportedClassVersionError")))
+                  (|<init>(Ljava/lang/String;)V| exc
+                   (jstring (format nil "Unsupported class file version ~A.~A (max supported: 69.0)"
+                                    major-version minor-version)))
+                  (error (%lisp-condition exc))))
+              (setf (slot-value class 'major-version) major-version)
+              (setf (slot-value class 'minor-version) minor-version)
+              (let ((constant-pool-count (read-u2)))
+                (let ((constant-pool (make-array (1+ constant-pool-count) :initial-element nil))
+                      (skip nil))
+                  (setf (slot-value class 'constant-pool) constant-pool)
+                  (dotimes (i (1- constant-pool-count))
+                    (if skip
+                        (setf skip nil)
+                        (let ((tag (read-u1)))
+                          (setf (aref constant-pool (1+ i))
+                                ;; https://en.wikipedia.org/wiki/Java_class_file
+                                (ccase tag
+                                  (1
+                                   (let* ((size (read-u2))
+                                          (octets (read-buffer size)))
+                                     (make-instance 'ir-string-literal
+                                                    :value (modified-utf8-to-string octets))))
+                                  (3
+                                   (make-instance 'constant-int
+                                                  :value (unsigned-to-signed-integer (read-u4))))
+                                  (4
+                                   (make-instance 'constant-float
+                                                  :value (float-features:bits-single-float (read-u4))))
+                                  (5
+                                   (progn
+                                     (setf skip t)
+                                     (let ((ul (read-u8)))
+                                       (make-instance 'constant-long
+                                                      :value (unsigned-to-signed-long ul)))))
+                                  (6
+                                   (progn
+                                     (setf skip t)
+                                     (make-instance 'constant-double
+                                                    :value (float-features:bits-double-float (read-u8)))))
+                                  (7
+                                   (make-instance 'constant-class-reference
+                                                  :index (read-u2)))
+                                  (8
+                                   (make-instance 'constant-string-reference
+                                                  :index (read-u2)))
+                                  (9
+                                   (make-instance 'constant-field-reference
+                                                  :class-index (read-u2)
+                                                  :name-and-type-descriptor-index (read-u2)))
+                                  (10
+                                   (let ((class-index (read-u2))
+                                         (method-descriptor-index (read-u2)))
+                                     (make-instance 'constant-method-reference
+                                                    :class-index class-index
+                                                    :method-descriptor-index method-descriptor-index)))
+                                  (11
+                                   (let ((class-index (read-u2))
+                                         (method-descriptor-index (read-u2)))
+                                     (make-instance 'constant-interface-method-reference
+                                                    :class-index class-index
+                                                    :method-descriptor-index method-descriptor-index)))
+                                  (12
+                                   (let ((name-index (read-u2))
+                                         (type-descriptor-index (read-u2)))
+                                     (make-instance 'constant-name-and-type-descriptor
+                                                    :name-index name-index
+                                                    :type-descriptor-index type-descriptor-index)))
+                                  (15
+                                   (let ((reference-kind (read-u1))
+                                         (reference-index (read-u2)))
+                                     (make-instance 'constant-method-handle
+                                                    :reference-kind reference-kind
+                                                    :reference-index reference-index)))
+                                  (16
+                                   (let ((descriptor-index (read-u2)))
+                                     (make-instance 'constant-method-type
+                                                    :descriptor-index descriptor-index)))
+                                  (17
+                                   (let ((bootstrap-method-attr-index (read-u2))
+                                         (name-and-type-index (read-u2)))
+                                     (make-instance 'constant-dynamic
+                                                    :bootstrap-method-attr-index bootstrap-method-attr-index
+                                                    :name-and-type-index name-and-type-index)))
+                                  (18
+                                   (let ((bootstrap-method-attr-index (read-u2))
+                                         (name-and-type-index (read-u2)))
+                                     (make-instance 'constant-invoke-dynamic
+                                                    :bootstrap-method-attr-index bootstrap-method-attr-index
+                                                    :name-and-type-index name-and-type-index)))
+                                  (19
+                                   (make-instance 'constant-module-reference
+                                                  :name-index (read-u2)))
+                                  (20
+                                   (make-instance 'constant-package-reference
+                                                  :name-index (read-u2))))))))
+
+                  (let* ((access-flags (read-u2))
+                         (this-class (read-u2))
+                         (super-class (read-u2))
+                         (interface-count (read-u2)))
+                    (when (> interface-count 0)
+                      (setf interfaces (make-array interface-count)))
+                    (setf (slot-value class 'name) (slot-value (aref constant-pool (slot-value (aref constant-pool this-class) 'index)) 'value))
+                    (setf (slot-value class 'access-flags) access-flags)
+                    (when (> super-class 0)
+                      (setf super
+                            (let ((super (slot-value (aref constant-pool (slot-value (aref constant-pool super-class) 'index)) 'value)))
+                              (if (and (not (zerop (logand #x200 access-flags)))
+                                       (string= super "java/lang/Object"))
+                                  nil
+                                  super))))
+
+                    (dotimes (i interface-count)
+                      (let ((interface (read-u2)))
+                        (setf (aref interfaces i) (slot-value (aref constant-pool (slot-value (aref constant-pool interface) 'index)) 'value))))
+
+                    (let ((fields-count (read-u2)))
+                      (setf fields (make-array fields-count))
+                      (dotimes (i fields-count)
+                        (let* ((access-flags (read-u2))
+                               (name-index (read-u2))
+                               (descriptor-index (read-u2))
+                               (attributes-count (read-u2))
+                               (field (make-instance '<field>
+                                                     :class class
+                                                     :name (slot-value (aref constant-pool name-index) 'value)
+                                                     :descriptor (slot-value (aref constant-pool descriptor-index) 'value)
+                                                     :access-flags access-flags)))
+                          (setf (aref fields i) field)
+                          (setf (slot-value field 'attributes)
+                                (read-attributes bitio constant-pool class attributes-count)))))
+                    (let ((methods-count (read-u2)))
+                      (setf methods (make-array methods-count))
+                      (dotimes (i methods-count)
+                        (let* ((access-flags (read-u2))
+                               (name-index (read-u2))
+                               (descriptor-index (read-u2))
+                               (attributes-count (read-u2))
+                               (method (make-instance '<method>
+                                                      :class class
+                                                      :name (slot-value (aref constant-pool name-index) 'value)
+                                                      :descriptor (slot-value (aref constant-pool descriptor-index) 'value)
+                                                      :access-flags access-flags)))
+                          (setf (aref methods i) method)
+                          (setf (slot-value method 'attributes)
+                                (read-attributes bitio constant-pool class attributes-count)))))
+                    (setf (attributes class) (read-attributes bitio constant-pool class (read-u2)))))))))
+        (unless (= (fast-io:buffer-position fin-fast) (length octets))
+          (class-format-error "Trailing bytes after classfile"))))
+    (when (and (logbitp 4 (access-flags class))
+               (nth-value 1 (gethash "PermittedSubclasses" (attributes class))))
+      (class-format-error "A final class cannot declare permitted subclasses"))
+    class))
+
+(defun read-classfile (stream)
+  "Parse and structurally validate a class before its bytecodes reach the JIT."
+  (handler-case
+      (let ((class (%read-classfile stream)))
+        (verify-class-structure class)
+        (setf (verification-name class) (name class))
+        class)
+    (bytecode-verification-error (condition) (error condition))
+    (end-of-file () (class-format-error "Truncated classfile"))
+    (type-error (condition) (class-format-error "Malformed classfile: ~A" condition))))

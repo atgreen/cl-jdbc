@@ -1,0 +1,1004 @@
+;;; -*- Mode: LISP; Syntax: COMMON-LISP; Package: OPENLDK; Base: 10 -*-
+;;;
+;;; Copyright (C) 2024, 2025, 2026  Anthony Green <green@moxielogic.com>
+;;;
+;;; SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+;;;
+;;; This file is part of OpenLDK.
+
+;;; OpenLDK is free software; you can redistribute it and/or modify it
+;;; under the terms of the GNU General Public License as published by
+;;; the Free Software Foundation; either version 3, or (at your
+;;; option) any later version.
+
+;;; OpenLDK is distributed in the hope that it will be useful, but
+;;; WITHOUT ANY WARRANTY; without even the implied warranty of
+;;; MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+;;; General Public License for more details.
+
+;;; You should have received a copy of the GNU General Public License
+;;; along with OpenLDK; see the file COPYING.  If not, please see
+;;; <http://www.gnu.org/licenses/>.
+
+;;; Linking this library statically or dynamically with other modules is
+;;; making a combined work based on this library.  Thus, the terms and
+;;; conditions of the GNU General Public License cover the whole
+;;; combination.
+
+;;; As a special exception, the copyright holders of this library give
+;;; you permission to link this library with independent modules to
+;;; produce an executable, regardless of the license terms of these
+;;; independent modules, and to copy and distribute the resulting
+;;; executable under terms of your choice, provided that you also
+;;; meet, for each linked independent module, the terms and conditions
+;;; of the license of that module.  An independent module is a module
+;;; which is not derived from or based on this library.  If you modify
+;;; this library, you may extend this exception to your version of the
+;;; library, but you are not obligated to do so.  If you do not wish
+;;; to do so, delete this exception statement from your version.
+
+;;; ConstantPool natives and assorted JDK internals.
+
+(in-package :openldk)
+
+;;; JDK 9+ ConstantPool native methods (jdk/internal/reflect/ConstantPool)
+(defmethod |getUTF8At0(Ljava/lang/Object;I)Ljava/lang/String;| ((this |jdk/internal/reflect/ConstantPool|) cp index)
+  (let* ((cp (constant-pool (ldk-class cp)))
+         (s (format nil "~A" (emit (aref cp index) cp))))
+    (jstring s)))
+
+(defmethod |getIntAt0(Ljava/lang/Object;I)I| ((this |jdk/internal/reflect/ConstantPool|) cp index)
+  (let* ((cp (constant-pool (ldk-class cp)))
+         (i (slot-value (aref cp index) 'value)))
+    i))
+
+(defmethod |getLongAt0(Ljava/lang/Object;I)J| ((this |jdk/internal/reflect/ConstantPool|) cp index)
+  (let* ((cp (constant-pool (ldk-class cp)))
+         (v (slot-value (aref cp index) 'value)))
+    v))
+
+(defmethod |getFloatAt0(Ljava/lang/Object;I)F| ((this |jdk/internal/reflect/ConstantPool|) cp index)
+  (let* ((cp (constant-pool (ldk-class cp)))
+         (v (slot-value (aref cp index) 'value)))
+    (coerce v 'single-float)))
+
+(defmethod |getDoubleAt0(Ljava/lang/Object;I)D| ((this |jdk/internal/reflect/ConstantPool|) cp index)
+  (let* ((cp (constant-pool (ldk-class cp)))
+         (v (slot-value (aref cp index) 'value)))
+    (coerce v 'double-float)))
+
+(defmethod |getSize0(Ljava/lang/Object;)I| ((this |jdk/internal/reflect/ConstantPool|) cp)
+  (length (constant-pool (ldk-class cp))))
+
+(defmethod |getTagAt0(Ljava/lang/Object;I)B| ((this |jdk/internal/reflect/ConstantPool|) cp index)
+  (let* ((pool (constant-pool (ldk-class cp)))
+         (entry (aref pool index)))
+    (etypecase entry
+      (ir-string-literal 1)   ; CONSTANT_Utf8 stored as ir-string-literal
+      (constant-int 3)
+      (constant-float 4)
+      (constant-long 5)
+      (constant-double 6)
+      (constant-class-reference 7)
+      (constant-string-reference 8)
+      (constant-field-reference 9)
+      (constant-interface-method-reference 11)
+      (constant-method-reference 10)
+      (constant-name-and-type-descriptor 12)
+      (constant-method-handle 15)
+      (constant-method-type 16)
+      (constant-invoke-dynamic 18)
+      (constant-dynamic 17)
+      (constant-module-reference 19)
+      (constant-package-reference 20)
+      (null 0))))
+
+(defclass byte-array-input-stream (trivial-gray-streams:fundamental-binary-input-stream)
+  ((array :initarg :array :reader stream-array)
+   (start :initarg :start :reader stream-start)
+   (end   :initarg :end   :reader stream-end)
+   (pos   :initform 0     :accessor stream-pos)))
+
+(defmethod trivial-gray-streams:stream-read-byte ((stream byte-array-input-stream))
+  ;; Reads the next byte, or returns :EOF at the end, as the Gray protocol asks
+  (with-slots (array start end pos) stream
+    (let ((index (+ start pos)))
+      (if (>= index end)
+          :eof
+          (prog1 (%signed-to-unsigned-byte (jaref array index))
+            (incf pos))))))
+
+(defmethod common-lisp:stream-element-type ((stream byte-array-input-stream))
+  '(unsigned-byte 8))
+
+(defun |java/lang/reflect/Proxy.defineClass0(Ljava/lang/ClassLoader;Ljava/lang/String;[BII)|
+    (class-loader class-name data offset length)
+  (let* ((ldk-loader (get-ldk-loader-for-java-loader class-loader))
+         (stream (make-instance 'byte-array-input-stream
+                               :array data
+                               :start offset
+                               :end (+ offset length))))
+    (let ((result (%classload-from-stream (substitute #\/ #\. (lstring class-name)) stream class-loader ldk-loader)))
+      (unless result
+        (let ((exc (%make-java-instance "java/lang/NoClassDefFoundError")))
+          (|<init>(Ljava/lang/String;)V| exc class-name)
+          (error (%lisp-condition exc))))
+      (java-class result))))
+
+(defmethod |defineClass(Ljava/lang/String;[BIILjava/lang/ClassLoader;Ljava/security/ProtectionDomain;)Ljava/lang/Class;|
+    ((unsafe |sun/misc/Unsafe|) class-name data offset length class-loader protection-domain)
+  (declare (ignore protection-domain))
+  (let* ((ldk-loader (get-ldk-loader-for-java-loader class-loader))
+         (stream (make-instance 'byte-array-input-stream :array data :start offset :end (+ offset length)))
+         (result (%classload-from-stream (if class-name
+                                             (substitute #\/ #\. (lstring class-name))
+                                             (%classfile-name data offset length))
+                                         stream class-loader ldk-loader)))
+    (unless result
+      (let ((exc (%make-java-instance "java/lang/NoClassDefFoundError")))
+        (|<init>(Ljava/lang/String;)V| exc class-name)
+        (error (%lisp-condition exc))))
+    (java-class result)))
+
+(defmethod |defineClass1(Ljava/lang/String;[BIILjava/security/ProtectionDomain;Ljava/lang/String;)|
+    ((class-loader |java/lang/ClassLoader|) class-name data offset length protection-domain source)
+  (declare (ignore source))
+  (let* ((ldk-loader (get-ldk-loader-for-java-loader class-loader))
+         (stream (make-instance 'byte-array-input-stream :array data :start offset :end (+ offset length)))
+         (result (%classload-from-stream (if class-name
+                                             (substitute #\/ #\. (lstring class-name))
+                                             (%classfile-name data offset length))
+                                         stream class-loader ldk-loader)))
+    (unless result
+      (let ((exc (%make-java-instance "java/lang/NoClassDefFoundError")))
+        (|<init>(Ljava/lang/String;)V| exc class-name)
+        (error (%lisp-condition exc))))
+    (when protection-domain
+      (setf (gethash (java-class result) *protection-domains*) protection-domain))
+    (java-class result)))
+
+(defmethod |allocateInstance(Ljava/lang/Class;)Ljava/lang/Object;| ((unsafe |sun/misc/Unsafe|) class)
+  (let* ((bin-name (substitute #\/ #\. (lstring (slot-value class '|name|))))
+         (pkg (%java-class-package class)))
+    (make-instance (intern bin-name pkg))))
+
+(defun |java/net/Inet4Address.init()V| ()
+  nil)
+
+(defmethod |getOption(I)Ljava/lang/Object;| ((this |java/net/SocketOptions|) option-id)
+  (declare (ignore this)
+           (ignore option-id))
+  (slot-value |+static-java/lang/Boolean+| '|TRUE|))
+
+(defun |sun/management/MemoryImpl.getMemoryManagers0()[Ljava/lang/management/MemoryManagerMXBean;| ()
+  (let* ((mm-mxbean-class (|java/lang/Class.forName0(Ljava/lang/String;ZLjava/lang/ClassLoader;Ljava/lang/Class;)Ljava/lang/Class;|
+                           (jstring "sun/management/MemoryManagerImpl") nil nil nil))
+         (mm-mxbean (%make-java-instance "sun/management/MemoryManagerImpl")))
+    (|<init>(Ljava/lang/String;)V| mm-mxbean (jstring "sbcl-heap-manager"))
+    (make-java-array :component-class (%get-java-class-by-bin-name "java/lang/management/MemoryManagerMXBean")
+                     :initial-contents (list mm-mxbean))))
+
+(defun |sun/management/MemoryImpl.getMemoryPools0()[Ljava/lang/management/MemoryPoolMXBean;| ()
+  (let* ((mp-mxbean-class (|java/lang/Class.forName0(Ljava/lang/String;ZLjava/lang/ClassLoader;Ljava/lang/Class;)Ljava/lang/Class;|
+                           (jstring "sun/management/MemoryPoolImpl") nil nil nil))
+
+         ;; Allocate a single pool for demonstration
+         (mp-mxbean (%make-java-instance "sun/management/MemoryPoolImpl")))
+
+    (|<init>(Ljava/lang/String;ZJJ)V|
+     mp-mxbean (jstring "SBCL Heap")
+     t                               ;; isHeap = true
+     ;; Negative thresholds mean "not supported" -- SBCL's GC has no
+     ;; usage/collection threshold notification mechanism to back them.
+     -1                              ;; usageThreshold
+     -1)                             ;; gcThreshold
+
+    ;; Return it as a Java array of the interface type
+    (make-java-array :component-class (%get-java-class-by-bin-name "java/lang/management/MemoryPoolMXBean")
+                     :initial-contents (list mp-mxbean))))
+
+(defun |jdk/internal/platform/CgroupMetrics.isUseContainerSupport()Z| ()
+  0)
+
+(defmethod |getStartupTime()J| ((this |sun/management/VMManagementImpl|))
+  "VM start time in epoch milliseconds (RuntimeMXBean.getStartTime)."
+  (or *vm-start-time-millis*
+      (|java/lang/System.currentTimeMillis()J|)))
+
+(defmethod |read0()I| ((this |java/io/FileInputStream|))
+  (let ((fd (%stream-fd this)))
+    (cond
+      ((eql fd 0) (force-output *standard-output*)
+                  (let ((b (read-byte *standard-input* nil nil)))
+                    (or b -1)))
+      ((streamp fd) (let ((b (read-byte fd nil nil)))
+                      (or b -1)))
+      (t (unimplemented "fd ~A in FileInputStream.read0" fd)))))
+
+(defun %class->descriptor-string (class)
+  "Return a JVM type descriptor fragment for the given java.lang.Class."
+  (let* ((raw-name (and (slot-exists-p class '|name|)
+                        (slot-boundp class '|name|)
+                        (slot-value class '|name|)))
+         (name (and raw-name (lstring raw-name))))
+    (cond
+      ((null name) (internal-error "Missing class name for descriptor ~A" class))
+      ((string= name "void") "V")
+      ((string= name "boolean") "Z")
+      ((string= name "byte") "B")
+      ((string= name "char") "C")
+      ((string= name "short") "S")
+      ((string= name "int") "I")
+      ((string= name "long") "J")
+      ((string= name "float") "F")
+      ((string= name "double") "D")
+      ;; Array names are already descriptor-shaped, except '.' vs '/'
+      ;; Normalize incorrect [Lprimitive; names (e.g. [Lbyte; → [B)
+      ((char= (char name 0) #\[)
+       (let ((rest (subseq name 1)))
+         (cond
+           ((string= rest "Lbyte;")    "[B")
+           ((string= rest "Lshort;")   "[S")
+           ((string= rest "Lint;")     "[I")
+           ((string= rest "Llong;")    "[J")
+           ((string= rest "Lfloat;")   "[F")
+           ((string= rest "Ldouble;")  "[D")
+           ((string= rest "Lchar;")    "[C")
+           ((string= rest "Lboolean;") "[Z")
+           (t (substitute #\/ #\. name)))))
+      (t
+       (format nil "L~A;" (substitute #\/ #\. name))))))
+
+(defun %build-method-descriptor (rtype ptypes-array)
+  (let* ((params (map 'list #'%class->descriptor-string
+                      (or (and ptypes-array (java-array-data ptypes-array))
+                          #())))
+         (ret (%class->descriptor-string rtype)))
+    (format nil "(~{~A~})~A" params ret)))
+
+(defun %make-simple-method-type (rtype ptypes-array)
+  "Construct a minimal MethodType instance backed by R T and PTYPES-ARRAY."
+  (classload "java/lang/invoke/MethodType")
+  (let* ((mt (%make-java-instance "java/lang/invoke/MethodType"))
+         (descriptor (%build-method-descriptor rtype ptypes-array)))
+    (setf (slot-value mt '|rtype|) rtype)
+    (when (slot-exists-p mt '|ptypes|)
+      (setf (slot-value mt '|ptypes|) ptypes-array))
+    (when (slot-exists-p mt '|methodDescriptor|)
+      (setf (slot-value mt '|methodDescriptor|) (jstring descriptor)))
+    mt))
+
+(defun |java/lang/invoke/MethodType.methodType(Ljava/lang/Class;)Ljava/lang/invoke/MethodType;| (rtype)
+  (%make-simple-method-type
+   rtype
+   (make-java-array :component-class (%get-java-class-by-bin-name "java/lang/Class")
+                    :initial-contents '())))
+
+(defun |java/lang/invoke/MethodType.methodType(Ljava/lang/Class;Ljava/lang/Class;)Ljava/lang/invoke/MethodType;| (rtype p0)
+  (%make-simple-method-type
+   rtype
+   (make-java-array :component-class (%get-java-class-by-bin-name "java/lang/Class")
+                    :initial-contents (list p0))))
+
+(defun |java/lang/invoke/MethodType.methodType(Ljava/lang/Class;[Ljava/lang/Class;)Ljava/lang/invoke/MethodType;| (rtype ptypes)
+  (%make-simple-method-type rtype ptypes))
+
+(defun |java/lang/invoke/MethodType.methodType(Ljava/lang/Class;Ljava/lang/Class;[Ljava/lang/Class;)Ljava/lang/invoke/MethodType;| (rtype p0 ptypes)
+  "MethodType.methodType(Class rtype, Class ptype0, Class... ptypes)"
+  (let* ((extra (java-array-data ptypes))
+         (all-ptypes (make-java-array :component-class (%get-java-class-by-bin-name "java/lang/Class")
+                                      :initial-contents (cons p0 (coerce extra 'list)))))
+    (%make-simple-method-type rtype all-ptypes)))
+
+(defun |java/lang/invoke/MethodType.parameterCount()I| (this)
+  "Native implementation of MethodType.parameterCount() with logging to trace arity issues."
+  (let* ((ptypes (when (and (slot-exists-p this '|ptypes|)
+                            (slot-boundp this '|ptypes|))
+                   (slot-value this '|ptypes|)))
+         (count (if ptypes
+                    (java-array-length ptypes)
+                    0)))
+    (format t "~&*** MethodType.parameterCount() called ***~%")
+    (format t "    MethodType: ~A~%" this)
+    (format t "    ptypes array: ~A~%" ptypes)
+    (format t "    Returning count: ~A~%" count)
+    (format t "    Type of count: ~A~%" (type-of count))
+    (force-output)
+    ;; If we see 255 being returned, trigger a break
+    (when (= count 255)
+      (format t "~%!!! WARNING: parameterCount() returning 255 - this is the bug! !!!~%")
+      (force-output)
+      (break "parameterCount() returned 255"))
+    count))
+
+(defun |java/lang/invoke/MethodHandleNatives.registerNatives()V| ()
+  nil)
+
+(defun |java/lang/invoke/MethodHandleNatives.getConstant(I)| (i)
+  (declare (ignore i))
+  0)
+
+(defun |java/lang/invoke/MethodHandleNatives.getNamedCon(I[Ljava/lang/Object;)I| (which objarray)
+  (declare (ignore objarray))
+  (assert (zerop which))
+  0)
+
+(defun find-method-in-class (class name &key static)
+  "Find a method by name in a class, walking the superclass chain so inherited
+   methods (e.g. AccessibleObject.canAccess seen through Method) resolve too.
+   When STATIC is :yes, only match static methods.
+   When STATIC is :no, only match non-static methods. When STATIC is nil, match any."
+  (or (find-if (lambda (m)
+                 (and (string= (slot-value m 'name) name)
+                      (case static
+                        (:yes (not (zerop (logand #x0008 (access-flags m)))))
+                        (:no  (zerop (logand #x0008 (access-flags m))))
+                        (t t))))
+               (coerce (slot-value class 'methods) 'list))
+      ;; Not declared here — climb to the superclass. SUPER holds the parent's
+      ;; binary name (NIL for java/lang/Object), so this terminates.
+      (let ((super-name (slot-value class 'super)))
+        (when super-name
+          (let ((super-class (%get-ldk-class-by-bin-name super-name t)))
+            (when super-class
+              (find-method-in-class super-class name :static static)))))))
+
+(defun find-field-in-class (class name)
+  "Find a field by name in CLASS, walking the superclass chain (interfaces are
+not searched -- VarHandle/MethodHandle field access targets declared fields)."
+  (or (find-if (lambda (f) (string= (slot-value f 'name) name))
+               (coerce (slot-value class 'fields) 'list))
+      (let ((super-name (slot-value class 'super)))
+        (when super-name
+          (let ((super-class (%get-ldk-class-by-bin-name super-name t)))
+            (when super-class
+              (find-field-in-class super-class name)))))))
+
+(defun |java/lang/invoke/MethodHandleNatives.resolve(Ljava/lang/invoke/MemberName;Ljava/lang/Class;IZ)Ljava/lang/invoke/MemberName;|
+    (member-name klass speculative-resolve native-access)
+  "JDK 17: resolve(MemberName self, Class<?> caller, int speculativeResolve, boolean nativeAccess)"
+  (declare (ignore klass speculative-resolve))
+  (let* ((member-class (slot-value member-name '|clazz|))
+         (ldk-class (get-ldk-class-for-java-class member-class))
+         (mn-flags (slot-value member-name '|flags|))
+         ;; Reference kind is in bits 24-27. REF_invokeStatic = 6.
+         (ref-kind (logand #xf (ash mn-flags -24)))
+         ;; Field access uses refKind getField/getStatic/putField/putStatic
+         ;; (1-4); MN_IS_FIELD is 0x40000.
+         (is-field (or (not (zerop (logand #x40000 mn-flags)))
+                       (<= 1 ref-kind 4)))
+         ;; Also check ACC_STATIC in modifier bits (0x0008)
+         (want-static (or (= ref-kind 6) (not (zerop (logand #x0008 mn-flags))))))
+    (if is-field
+        ;; Field MemberName (VarHandle/MethodHandle field access): OR in the
+        ;; field's real access flags so the JDK's Lookup access check sees the
+        ;; correct modifiers (e.g. ACC_PRIVATE for a class accessing its own
+        ;; private field), rather than treating it as package-private.
+        (let ((field (when ldk-class
+                       (find-field-in-class ldk-class (lstring (slot-value member-name '|name|))))))
+          (when field
+            (setf (slot-value member-name '|flags|) (logior mn-flags (access-flags field)))))
+        (let ((method (when ldk-class
+                        (find-method-in-class ldk-class (lstring (slot-value member-name '|name|))
+                                              :static (if want-static :yes :no)))))
+          ;; A speculative lookup must not manufacture a successful
+          ;; MemberName for an absent method. VarForm uses this to discover
+          ;; which access modes an implementation actually provides.
+          (when (and ldk-class (null method) (not (zerop native-access)))
+            (return-from |java/lang/invoke/MethodHandleNatives.resolve(Ljava/lang/invoke/MemberName;Ljava/lang/Class;IZ)Ljava/lang/invoke/MemberName;| nil))
+          (when method
+            (setf (slot-value member-name '|flags|) (logior mn-flags (access-flags method)))))))
+  member-name)
+
+(defun |java/lang/invoke/MethodHandleNatives.getMemberVMInfo(Ljava/lang/invoke/MemberName;)Ljava/lang/Object;| (member-name)
+  (let ((o (%make-java-instance "java/lang/Long"))
+        (vm-target member-name)
+        (flags (slot-value member-name '|flags|)))
+    (cond
+      ((eq (logand flags #x40000) #x40000)
+       ;; Field
+       (setf vm-target (slot-value member-name '|type|))
+       (setf (slot-value o '|value|) 31337))
+      ((and (eq (logand flags #x10000) #x10000)
+            (eq (logand flags (ash 6 24)) (ash 6 24)))
+       ;; Static Method
+       (setf (slot-value o '|value|) -31337))
+      (t
+       ;; Other Method
+       (setf (slot-value o '|value|) 31337)))
+    (make-java-array :component-class (%get-java-class-by-bin-name "java/lang/Object")
+                     :initial-contents (list o vm-target))))
+
+(defun |java/lang/invoke/MethodHandleNatives.staticFieldOffset(Ljava/lang/invoke/MemberName;)J| (member-name)
+  "Return a synthetic Unsafe offset for the static field named by MEMBER-NAME.
+   Mirrors Unsafe.staticFieldOffset(Field) but sources the class/name from a
+   resolved MemberName (used when lowering static-field VarHandles/MethodHandles)."
+  (let ((f (make-instance '%synthetic-field
+                          :name (slot-value member-name '|name|)
+                          :clazz (slot-value member-name '|clazz|))))
+    (%register-field-offset f)))
+
+(defun |java/lang/invoke/MethodHandleNatives.staticFieldBase(Ljava/lang/invoke/MemberName;)Ljava/lang/Object;| (member-name)
+  "OpenLDK models statics as class-allocated CLOS slots, so the base object is
+   unused; the field resolves from its offset alone (see %unsafe-static-storage)."
+  (declare (ignore member-name))
+  nil)
+
+;; objectFieldOffset(MemberName) is defined in methodhandles.lisp (loaded later);
+;; no duplicate here.
+
+(defun |java/lang/invoke/MethodHandleNatives.init(Ljava/lang/invoke/MemberName;Ljava/lang/Object;)V| (member-name objref)
+  (setf (slot-value member-name '|clazz|) (slot-value objref '|clazz|))
+
+  ;; A MemberName can also be initialized from a reflected Constructor.
+  ;; java.lang.reflect.Constructor has no `name` field (unlike Method/Field), so
+  ;; we must not read it; the JDK names such a MemberName "<init>" with
+  ;; MN_IS_CONSTRUCTOR (0x20000) and refKind REF_newInvokeSpecial (8).
+  (when (typep objref '|java/lang/reflect/Constructor|)
+    (setf (slot-value member-name '|name|) (jstring "<init>"))
+    (setf (slot-value member-name '|flags|)
+          (logior #x20000 (ash 8 24) (slot-value objref '|modifiers|)))
+    (return-from |java/lang/invoke/MethodHandleNatives.init(Ljava/lang/invoke/MemberName;Ljava/lang/Object;)V|
+      member-name))
+
+  (setf (slot-value member-name '|name|) (slot-value objref '|name|))
+
+  ;; A MemberName can be initialized from either a reflected Method or a
+  ;; reflected Field (e.g. Lookup.unreflectGetter / findGetter, and field
+  ;; VarHandles as used by Clojure's RT/Reflector). Handle the Field case
+  ;; first, then fall through to the method handling below.
+  (when (typep objref '|java/lang/reflect/Field|)
+    ;; MN_IS_FIELD (0x40000) | refKind<<24 | modifiers. Default to a getter
+    ;; reference kind (REF_getStatic=2 for static, REF_getField=1 otherwise);
+    ;; the setter view is derived later by MemberName when needed.
+    (when (slot-exists-p member-name '|type|)
+      (setf (slot-value member-name '|type|) (slot-value objref '|type|)))
+    (let* ((mods (slot-value objref '|modifiers|))
+           (ref-kind (if (zerop (logand #x8 mods)) 1 2)))
+      (setf (slot-value member-name '|flags|)
+            (logior #x40000 (ash ref-kind 24) mods)))
+    (return-from |java/lang/invoke/MethodHandleNatives.init(Ljava/lang/invoke/MemberName;Ljava/lang/Object;)V|
+      member-name))
+
+  ;; Otherwise it must be a method
+  (assert (typep objref '|java/lang/reflect/Method|))
+
+  #|
+  See https://github.com/openjdk/jdk8u/blob/b10963f0e8db961c6122e092372c5dc56e1a755e/hotspot/src/share/vm/prims/methodHandles.cpp
+  and...
+        static final int
+                MN_IS_METHOD           = 0x00010000, // method (not constructor)
+                MN_IS_CONSTRUCTOR      = 0x00020000, // constructor
+                MN_IS_FIELD            = 0x00040000, // field
+                MN_IS_TYPE             = 0x00080000, // nested type
+                MN_CALLER_SENSITIVE    = 0x00100000, // @CallerSensitive annotation detected
+                MN_REFERENCE_KIND_SHIFT = 24, // refKind
+                MN_REFERENCE_KIND_MASK = 0x0F000000 >> MN_REFERENCE_KIND_SHIFT,
+                // The SEARCH_* bits are not for MN.flags but for the matchFlags argument of MHN.getMembers:
+                MN_SEARCH_SUPER CLASSES = 0x00100000,
+                MN_SEARCH_INTERFACES   = 0x00200000;
+
+  Also of note:
+
+            REF_NONE                    = 0,  // null value
+            REF_getField                = 1,
+            REF_getStatic               = 2,
+            REF_putField                = 3,
+            REF_putStatic               = 4,
+            REF_invokeVirtual           = 5,
+            REF_invokeStatic            = 6,
+            REF_invokeSpecial           = 7,
+            REF_newInvokeSpecial        = 8,
+            REF_invokeInterface         = 9,
+            REF_LIMIT                  = 10;
+  |#
+
+  (cond
+    ((not (eq 0 (logand #x8 (slot-value objref '|modifiers|))))
+     ;; Static method
+     (setf (slot-value member-name '|flags|) (logior #x10000 (ash 6 24) (slot-value objref '|modifiers|))))
+    (t
+     ;; Any other method
+     (setf (slot-value member-name '|flags|) (logior #x10000 (ash 5 24) (slot-value objref '|modifiers|))))))
+
+(defmethod |defineAnonymousClass(Ljava/lang/Class;[B[Ljava/lang/Object;)|
+    ((unsafe |sun/misc/Unsafe|) clazz data cp-patches)
+  (let* ((stream (make-instance 'byte-array-input-stream :array data :start 0 :end (java-array-length data)))
+         (java-loader (slot-value clazz '|classLoader|))
+         (ldk-loader (get-ldk-loader-for-java-loader java-loader))
+         (result (%classload-from-stream (format nil "~A/~A" (substitute #\/ #\. (lstring (slot-value clazz '|name|))) (gensym "anonymous-class-")) stream java-loader ldk-loader)))
+    (unless result
+      (let ((exc (%make-java-instance "java/lang/NoClassDefFoundError")))
+        (|<init>(Ljava/lang/String;)V| exc (slot-value clazz '|name|))
+        (error (%lisp-condition exc))))
+    (java-class result)))
+
+(defun %invoke-polymorphic-signature (method-handle &rest args)
+  "MethodHandle.invokeExact, invoke and invokeBasic: run METHOD-HANDLE on
+ARGS (see %MH-INVOKE, in jsr292.lisp)."
+  (%mh-invoke method-handle args))
+
+(defun %make-trusted-lookup (&optional lookup-class)
+  "Return a trusted MethodHandles.Lookup instance. We intentionally relax access
+checks for now; lookupClass is LOOKUP-CLASS, by default Object (a NIL
+lookupClass blows up in LambdaMetafactory), allowedModes is TRUSTED (-1) so
+Lookup.checkAccess is bypassed."
+  (classload "java/lang/invoke/MethodHandles$Lookup")
+  (let ((lk (%make-java-instance "java/lang/invoke/MethodHandles$Lookup"))
+        (caller-class (or lookup-class (%get-java-class-by-bin-name "java/lang/Object"))))
+    (when (slot-exists-p lk '|lookupClass|)
+      (setf (slot-value lk '|lookupClass|) caller-class))
+    (when (slot-exists-p lk '|allowedModes|)
+      (setf (slot-value lk '|allowedModes|) -1)) ; TRUSTED in JDK sources
+    lk))
+
+(defun |java/lang/invoke/MethodHandles.lookup()Ljava/lang/invoke/MethodHandles$Lookup;| ()
+  (%make-trusted-lookup))
+
+;; MethodHandles.lookup() is caller-sensitive. Supply the actual caller and
+;; ordinary ORIGINAL lookup modes instead of making every Java caller trusted.
+;; VM bootstrap operations use %MAKE-TRUSTED-LOOKUP explicitly.
+(defun %methodhandles-lookup ()
+  (let ((lookup (%make-trusted-lookup (%java-caller-class '%methodhandles-lookup))))
+    (setf (slot-value lookup '|allowedModes|) #x5f)
+    lookup))
+
+(setf (gethash "java/lang/invoke/MethodHandles.lookup()Ljava/lang/invoke/MethodHandles$Lookup;" *native-overrides*)
+      (lambda () (%methodhandles-lookup)))
+
+(defun |java/lang/invoke/MethodHandles$Lookup.lookupClass()Ljava/lang/Class;| (this)
+  "Return the class this lookup was created for."
+  (when (slot-exists-p this '|lookupClass|)
+    (slot-value this '|lookupClass|)))
+
+(defun |java/lang/invoke/MethodHandles$Lookup.hasFullPrivilegeAccess()Z| (this)
+  "Full privilege requires both private and module access (or a trusted lookup)."
+  (let ((modes (slot-value this '|allowedModes|)))
+    (if (or (= modes -1) (= (logand modes #x12) #x12)) 1 0)))
+
+(defun %check-lookup-method-access (lookup refc member method-type ref-kind)
+  "Check a native method-handle lookup with the JDK's Lookup access rules."
+  (unless (= -1 (slot-value lookup '|allowedModes|))
+    (let* ((class (get-ldk-class-for-java-class refc))
+           (name (lstring (slot-value member '|name|)))
+           (descriptor (%build-method-descriptor (slot-value method-type '|rtype|)
+                                                 (slot-value method-type '|ptypes|)))
+           (signature (concatenate 'string name descriptor))
+           (owner (if (= ref-kind 8) class (%find-declaring-class class signature)))
+           (method (and owner (gethash signature (%class-method-name-table owner)))))
+      (unless method
+        (%throw '|java/lang/NoSuchMethodException| signature))
+      (setf (slot-value member '|clazz|) (java-class owner)
+            (slot-value member '|flags|)
+            (logior (logand (slot-value member '|flags|) #xffff0000) (access-flags method)))
+      (|checkAccess(BLjava/lang/Class;Ljava/lang/invoke/MemberName;)V| lookup ref-kind refc member))))
+
+(defun %build-member-name-for-static (klass name method-type)
+  (classload "java/lang/invoke/MemberName")
+  (let* ((mn (%make-java-instance "java/lang/invoke/MemberName"))
+         ;; MN_IS_METHOD | REF_invokeStatic << 24 | ACC_STATIC
+         (flags (logior #x10000 (ash 6 24) #x0008)))
+    (when (slot-exists-p mn '|clazz|)
+      (setf (slot-value mn '|clazz|) klass))
+    (when (slot-exists-p mn '|name|)
+      (setf (slot-value mn '|name|) name))
+    (when (slot-exists-p mn '|type$|)
+      (setf (slot-value mn '|type$|) method-type))
+    (when (slot-exists-p mn '|type|)
+      (setf (slot-value mn '|type|) method-type))
+    (when (slot-exists-p mn '|flags|)
+      (setf (slot-value mn '|flags|) flags))
+    mn))
+
+(defun |java/lang/invoke/DirectMethodHandle.isCrackable()Z| (this)
+  "DirectMethodHandles are crackable - they can reveal their internal MemberName."
+  (declare (ignore this))
+  1) ; Return 1 (true in Java)
+
+(defun |java/lang/invoke/MethodHandle.isCrackable()Z| (this)
+  "Base MethodHandles are not crackable."
+  (declare (ignore this))
+  0) ; Return 0 (false in Java)
+
+(defun |java/lang/invoke/DirectMethodHandle.internalMemberName()Ljava/lang/invoke/MemberName;| (this)
+  "Return the MemberName from a DirectMethodHandle."
+  (format t "~&*** internalMemberName() called on DirectMethodHandle~%")
+  (let ((result (when (and (slot-exists-p this '|member|)
+                          (slot-boundp this '|member|))
+                 (slot-value this '|member|))))
+    (format t "~&*** internalMemberName() returning: ~A~%" result)
+    result))
+
+(defun |java/lang/invoke/MethodHandle.internalMemberName()Ljava/lang/invoke/MemberName;| (this)
+  "Base MethodHandles don't have an internal MemberName."
+  (declare (ignore this))
+  nil)
+
+(defun |java/lang/invoke/MethodHandles$Lookup.findStatic(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/invoke/MethodType;)Ljava/lang/invoke/MethodHandle;|
+    (lookup klass name method-type)
+  "Create a DirectMethodHandle for static method invocation.
+   DirectMethodHandle is required by LambdaMetafactory for lambda expressions."
+  (classload "java/lang/invoke/DirectMethodHandle")
+  (classload "java/lang/invoke/LambdaForm")
+  (let* ((member (%build-member-name-for-static klass name method-type))
+         (lf (%make-java-instance "java/lang/invoke/LambdaForm"))
+         (mh (%make-java-instance "java/lang/invoke/DirectMethodHandle")))
+    (%check-lookup-method-access lookup klass member method-type 6)
+    ;; Set vmentry on LambdaForm
+    (setf (slot-value lf '|vmentry|) member)
+
+    ;; Java bytecode reads the mangled MethodHandle.type field.
+    (when (slot-exists-p mh '|type$|)
+      (setf (slot-value mh '|type$|) method-type))
+    ;; Retain the legacy slot for Lisp-native handle consumers.
+    (when (slot-exists-p mh '|type|)
+      (setf (slot-value mh '|type|) method-type))
+
+    ;; Set form on MethodHandle
+    (when (slot-exists-p mh '|form|)
+      (setf (slot-value mh '|form|) lf))
+
+    ;; Set the member field
+    (setf (slot-value mh '|member|) member)
+    mh))
+
+(defun %build-member-name-for-special (klass name method-type)
+  "Build a MemberName for invokespecial (private methods, constructors, super calls)."
+  (classload "java/lang/invoke/MemberName")
+  (let* ((mn (%make-java-instance "java/lang/invoke/MemberName"))
+         ;; MN_IS_METHOD | REF_invokeSpecial << 24 (special = 7)
+         (flags (logior #x10000 (ash 7 24))))
+    (when (slot-exists-p mn '|clazz|)
+      (setf (slot-value mn '|clazz|) klass))
+    (when (slot-exists-p mn '|name|)
+      (setf (slot-value mn '|name|) name))
+    (when (slot-exists-p mn '|type$|)
+      (setf (slot-value mn '|type$|) method-type))
+    (when (slot-exists-p mn '|type|)
+      (setf (slot-value mn '|type|) method-type))
+    (when (slot-exists-p mn '|flags|)
+      (setf (slot-value mn '|flags|) flags))
+    mn))
+
+(defun |java/lang/invoke/MethodHandles$Lookup.findSpecial(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/invoke/MethodType;Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;|
+    (lookup refc name method-type special-caller)
+  "Create a DirectMethodHandle for invokespecial method invocation.
+   Used for private methods, constructors, and super calls in lambda metafactory."
+  (declare (ignore special-caller))
+  (classload "java/lang/invoke/DirectMethodHandle")
+  (classload "java/lang/invoke/LambdaForm")
+  (let* ((member (%build-member-name-for-special refc name method-type))
+         (lf (%make-java-instance "java/lang/invoke/LambdaForm"))
+         (mh (%make-java-instance "java/lang/invoke/DirectMethodHandle")))
+    ;; Set vmentry on LambdaForm
+    (%check-lookup-method-access lookup refc member method-type 7)
+    (setf (slot-value lf '|vmentry|) member)
+
+    ;; Set type on MethodHandle
+    (when (slot-exists-p mh '|type|)
+      (setf (slot-value mh '|type|) method-type))
+
+    ;; Set form on MethodHandle
+    (when (slot-exists-p mh '|form|)
+      (setf (slot-value mh '|form|) lf))
+
+    ;; Set the member field
+    (setf (slot-value mh '|member|) member)
+    mh))
+
+(defun %build-member-name-for-constructor (klass method-type)
+  "Build a MemberName for constructor invocation."
+  (classload "java/lang/invoke/MemberName")
+  (let* ((mn (%make-java-instance "java/lang/invoke/MemberName"))
+         ;; MN_IS_CONSTRUCTOR | REF_newInvokeSpecial << 24 (newInvokeSpecial = 8)
+         (flags (logior #x20000 (ash 8 24))))
+    (when (slot-exists-p mn '|clazz|)
+      (setf (slot-value mn '|clazz|) klass))
+    (when (slot-exists-p mn '|name|)
+      (setf (slot-value mn '|name|) (jstring "<init>")))
+    (when (slot-exists-p mn '|type$|)
+      (setf (slot-value mn '|type$|) method-type))
+    (when (slot-exists-p mn '|type|)
+      (setf (slot-value mn '|type|) method-type))
+    (when (slot-exists-p mn '|flags|)
+      (setf (slot-value mn '|flags|) flags))
+    mn))
+
+(defun |java/lang/invoke/MethodHandles$Lookup.findConstructor(Ljava/lang/Class;Ljava/lang/invoke/MethodType;)Ljava/lang/invoke/MethodHandle;| (lookup refc method-type)
+  "Create a DirectMethodHandle for constructor invocation.
+   Used by lambda metafactory for method references to constructors."
+  (classload "java/lang/invoke/DirectMethodHandle")
+  (classload "java/lang/invoke/LambdaForm")
+  (let* ((member (%build-member-name-for-constructor refc method-type))
+         (lf (%make-java-instance "java/lang/invoke/LambdaForm"))
+         (mh (%make-java-instance "java/lang/invoke/DirectMethodHandle")))
+    ;; Set vmentry on LambdaForm
+    (%check-lookup-method-access lookup refc member method-type 8)
+    (setf (slot-value lf '|vmentry|) member)
+
+    ;; Set type on MethodHandle
+    (when (slot-exists-p mh '|type|)
+      (setf (slot-value mh '|type|) method-type))
+
+    ;; Set form on MethodHandle
+    (when (slot-exists-p mh '|form|)
+      (setf (slot-value mh '|form|) lf))
+
+    ;; Set the member field
+    (setf (slot-value mh '|member|) member)
+    mh))
+
+(defun %build-member-name-for-virtual (klass name method-type)
+  "Build a MemberName for virtual method invocation."
+  (classload "java/lang/invoke/MemberName")
+  (let* ((mn (%make-java-instance "java/lang/invoke/MemberName"))
+         ;; MN_IS_METHOD | REF_invokeVirtual << 24 (virtual = 5)
+         (flags (logior #x10000 (ash 5 24))))
+    (when (slot-exists-p mn '|clazz|)
+      (setf (slot-value mn '|clazz|) klass))
+    (when (slot-exists-p mn '|name|)
+      (setf (slot-value mn '|name|) name))
+    (when (slot-exists-p mn '|type$|)
+      (setf (slot-value mn '|type$|) method-type))
+    (when (slot-exists-p mn '|type|)
+      (setf (slot-value mn '|type|) method-type))
+    (when (slot-exists-p mn '|flags|)
+      (setf (slot-value mn '|flags|) flags))
+    mn))
+
+(defun |java/lang/invoke/MethodHandles$Lookup.findVirtual(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/invoke/MethodType;)Ljava/lang/invoke/MethodHandle;|
+    (lookup refc name method-type)
+  "Create a DirectMethodHandle for virtual method invocation.
+   Used by lambda metafactory for instance method references."
+  (classload "java/lang/invoke/DirectMethodHandle")
+  (classload "java/lang/invoke/LambdaForm")
+  (let* ((member (%build-member-name-for-virtual refc name method-type))
+         (lf (%make-java-instance "java/lang/invoke/LambdaForm"))
+         (mh (%make-java-instance "java/lang/invoke/DirectMethodHandle")))
+    ;; Set vmentry on LambdaForm
+    (%check-lookup-method-access lookup refc member method-type 5)
+    (setf (slot-value lf '|vmentry|) member)
+
+    ;; Set type on MethodHandle
+    (when (slot-exists-p mh '|type|)
+      (setf (slot-value mh '|type|) method-type))
+
+    ;; Set form on MethodHandle
+    (when (slot-exists-p mh '|form|)
+      (setf (slot-value mh '|form|) lf))
+
+    ;; Set the member field
+    (setf (slot-value mh '|member|) member)
+    mh))
+
+(defun |java/lang/invoke/CallSite.getTarget()Ljava/lang/invoke/MethodHandle;| (this)
+  "Accessor required by generated invokedynamic stubs."
+  (when (slot-exists-p this '|target|)
+    (slot-value this '|target|)))
+
+(defun |java/lang/invoke/MethodHandles$Lookup.revealDirect(Ljava/lang/invoke/MethodHandle;)Ljava/lang/invoke/MethodHandleInfo;| (lookup target)
+  "Crack a direct method handle to reveal its MemberName.
+   Returns a MethodHandleInfo that wraps the MemberName."
+  (declare (ignore lookup))
+  (format t "~&*** revealDirect() called on: ~A~%" target)
+  ;; Check if target has a member slot (i.e., is a DirectMethodHandle)
+  (unless (and (slot-exists-p target '|member|)
+               (slot-boundp target '|member|))
+    (format t "~&*** revealDirect() ERROR: target has no member slot or it's unbound~%")
+    (let ((exc (%make-java-instance "java/lang/IllegalArgumentException")))
+      (|<init>(Ljava/lang/String;)V| exc (jstring "not a direct method handle"))
+      (error (%lisp-condition exc))))
+
+  ;; Extract the MemberName
+  (let ((member (slot-value target '|member|)))
+    (format t "~&*** revealDirect() member = ~A~%" member)
+    (unless member
+      (format t "~&*** revealDirect() ERROR: member is NIL~%")
+      (let ((exc (%make-java-instance "java/lang/IllegalArgumentException")))
+        (|<init>(Ljava/lang/String;)V| exc (jstring "not a direct method handle"))
+        (error (%lisp-condition exc))))
+
+    ;; Get the reference kind from the MemberName flags
+    ;; The flags field encodes the reference kind in bits 24-27
+    (let* ((flags (when (and (slot-exists-p member '|flags|)
+                            (slot-boundp member '|flags|))
+                   (slot-value member '|flags|)))
+           (ref-kind (if flags
+                         (logand #xFF (ash flags -24))
+                         5))) ; Default to REF_invokeVirtual if no flags
+
+      ;; Create and return InfoFromMemberName
+      (classload "java/lang/invoke/InfoFromMemberName")
+      (let ((info (%make-java-instance "java/lang/invoke/InfoFromMemberName")))
+        ;; Set the member field
+        (when (slot-exists-p info '|member|)
+          (setf (slot-value info '|member|) member))
+        ;; Set the referenceKind field
+        (when (slot-exists-p info '|referenceKind|)
+          (setf (slot-value info '|referenceKind|) ref-kind))
+        info))))
+
+(defun %descriptor-param-prim-flags (descriptor)
+  "Return a list of booleans, one per parameter of DESCRIPTOR, true when that
+parameter has a primitive type (Z B S C I J F D)."
+  (let ((flags nil)
+        (index (1+ (position #\( descriptor)))
+        (end (position #\) descriptor)))
+    (loop while (< index end)
+          do (let ((ch (char descriptor index)))
+               (cond
+                 ((find ch "ZBSCIJFD") (push t flags) (incf index))
+                 ((char= ch #\L)
+                  (push nil flags)
+                  (setf index (1+ (position #\; descriptor :start index))))
+                 ((char= ch #\[)
+                  (loop while (char= (char descriptor index) #\[) do (incf index))
+                  (if (char= (char descriptor index) #\L)
+                      (setf index (1+ (position #\; descriptor :start index)))
+                      (incf index))
+                  (push nil flags))
+                 (t (incf index)))))
+    (nreverse flags)))
+
+(defun %maybe-unbox (arg)
+  "If ARG is a boxed primitive wrapper object, return its primitive value;
+otherwise return ARG unchanged."
+  (if (and arg
+           (typep arg '|java/lang/Object|)
+           (slot-exists-p arg '|value|)
+           (slot-boundp arg '|value|)
+           (typep arg '(or |java/lang/Integer| |java/lang/Long| |java/lang/Short|
+                        |java/lang/Byte| |java/lang/Character| |java/lang/Boolean|
+                        |java/lang/Float| |java/lang/Double|)))
+      (slot-value arg '|value|)
+      arg))
+
+(defun %descriptor-unbox-flags (descriptor)
+  "%DESCRIPTOR-PARAM-PRIM-FLAGS of DESCRIPTOR, or NIL when no parameter is
+primitive and nothing needs unboxing."
+  (and descriptor
+       (let ((flags (%descriptor-param-prim-flags descriptor)))
+         (and (some #'identity flags) flags))))
+
+(defun %unbox-args-for-flags (flags args)
+  "ARGS, each whose FLAGS entry (from %DESCRIPTOR-UNBOX-FLAGS) is true unboxed."
+  (if (null flags)
+      args
+      (loop for prim in flags
+            for arg in args
+            collect (if prim (%maybe-unbox arg) arg))))
+
+(defun %unbox-args-for-descriptor (descriptor args)
+  "Unbox each element of ARGS whose corresponding parameter in DESCRIPTOR is a
+primitive type. ARGS must line up with the descriptor's declared parameters
+(i.e. any leading receiver has already been removed). Returns a fresh list."
+  (if (null descriptor)
+      args
+      (loop for prim in (%descriptor-param-prim-flags descriptor)
+            for arg in args
+            collect (if prim (%maybe-unbox arg) arg))))
+
+(defvar *member-name-invoke-cache*
+  (make-hash-table :test 'eq :weakness :key :synchronized t)
+  "Memoized invocation plans keyed by MemberName instance (eq, weak on key) so
+that linkTo*/%invoke-from-member-name resolves the target symbol once per call
+site instead of on every invocation.")
+
+(defvar *member-plans* (make-hash-table :test 'eq :weakness :key :synchronized t)
+  "(class name type flags) -> invocation plan: the plans of MemberNames
+naming the same member, which code creates afresh again and again (Scala's
+compiler made 39,000 for 344 members in one compilation).")
+
+(defun %member-name-slot (member-name slot)
+  (when (and (slot-exists-p member-name slot) (slot-boundp member-name slot))
+    (slot-value member-name slot)))
+
+(defun %member-name-key (member-name)
+  "The key of the member MEMBER-NAME names in *MEMBER-PLANS*, or NIL."
+  (let ((clazz (%member-name-slot member-name '|clazz|))
+        (name (%member-name-slot member-name '|name|)))
+    (when (and clazz name)
+      (list clazz (lstring name)
+            (%member-name-slot member-name '|type$|)
+            (%member-name-slot member-name '|flags|)))))
+
+(defvar *last-member-plan* (cons nil nil)
+  "Weak (MemberName . plan) of the last %RESOLVE-MEMBER-NAME, replaced whole so
+threads never see one's name with another's plan.  A loop calling one
+lambda finds its plan here, without the weak table's lock.")
+
+(defun %resolve-member-name (member-name)
+  "Resolve MEMBER-NAME to a cached invocation plan (kind a b ret-char):
+   (:constructor class-symbol init-symbol    nil)
+   (:static      fn-symbol    unbox-flags    ret-char declaring-class)
+   (:instance    fn-symbol    unbox-flags    ret-char)
+UNBOX-FLAGS are %DESCRIPTOR-UNBOX-FLAGS of the descriptor, and RET-CHAR is
+%GET-RETURN-TYPE-CHAR of the MemberName.  The plan depends only on the
+(stable) MemberName, so it is memoized, by the MemberName and by the
+member it names."
+  (let* ((last *last-member-plan*)
+         (previous (and (car last) (sb-ext:weak-pointer-value (car last))))
+         (cached (and (eq previous member-name) (cdr last) (sb-ext:weak-pointer-value (cdr last)))))
+    (or cached
+        (let ((plan (or (gethash member-name *member-name-invoke-cache*)
+                        (setf (gethash member-name *member-name-invoke-cache*)
+                              (let* ((key (%member-name-key member-name))
+                                     (types (and key (%owner-cache-table *member-plans* (first key) 'eq :key)))
+                                     (table (and types (%owner-cache-table types (third key))))
+                                     (signature (and key (list (second key) (fourth key)))))
+                                (or (and table (gethash signature table))
+                                    (let ((plan (%compute-member-name-plan member-name)))
+                                      (when table (setf (gethash signature table) plan))
+                                      plan)))))))
+          (setf *last-member-plan* (cons (sb-ext:make-weak-pointer member-name) (sb-ext:make-weak-pointer plan)))
+          plan))))
+
+(defun %compute-member-name-plan (member-name)
+  "The invocation plan, as %RESOLVE-MEMBER-NAME returns, for MEMBER-NAME."
+  (let ((clazz (%member-name-slot member-name '|clazz|))
+        (name (%member-name-slot member-name '|name|))
+        (type (%member-name-slot member-name '|type$|))
+        (flags (%member-name-slot member-name '|flags|)))
+    (unless (and clazz name)
+      (internal-error "linkTo*: incomplete MemberName ~A" member-name))
+    (let* ((class-name (substitute #\/ #\. (lstring (slot-value clazz '|name|))))
+           (method-name (lstring name))
+           ;; type is a String descriptor or a MethodType
+           (method-type (if (and type (typep type '|java/lang/String|))
+                            (lstring type)
+                            (when type
+                              (let ((rtype (slot-value type '|rtype|))
+                                    (ptypes (when (slot-exists-p type '|ptypes|)
+                                              (slot-value type '|ptypes|))))
+                                (%build-method-descriptor rtype ptypes)))))
+           ;; REF_invokeVirtual=5 Static=6 Special=7 newInvokeSpecial=8
+           (ref-kind (ash (logand flags #x0F000000) -24)))
+      (cond
+        ((= ref-kind 8)       ; constructor
+         (let* ((ldk-class (get-ldk-class-for-java-class clazz))
+                ;; <init> is void; normalise any return type to V
+                (desc (cond
+                        ((null method-type) "()V")
+                        ((position #\) method-type)
+                         (format nil "~AV" (subseq method-type 0 (1+ (position #\) method-type)))))
+                        (t (format nil "~AV" method-type))))
+                (init-method-name (format nil "<init>~A" (subseq desc 0 (1+ (position #\) desc)))))
+                (lisp-init-name (intern init-method-name :openldk)))
+           (list :constructor ldk-class lisp-init-name nil (%descriptor-unbox-flags desc))))
+        ((= ref-kind 6)       ; static: name is class.method(desc) in the loader package
+         (let* ((owner (get-ldk-class-for-java-class clazz))
+                (signature (format nil "~A~A" method-name method-type))
+                (declaring (or (%find-declaring-class owner signature) owner))
+                (pkg (ldk-class-package declaring))
+                (full-method-sig (format nil "~A.~A" (name declaring) signature)))
+           (list :static (static-method-symbol (lispize-method-name full-method-sig) pkg)
+                 (%descriptor-unbox-flags method-type)
+                 (%get-return-type-char member-name) declaring)))
+        (t                    ; virtual/special/interface: GF named by method+descriptor
+         (list :instance
+               (intern (lispize-method-name (format nil "~A~A" method-name method-type)) :openldk)
+               (%descriptor-unbox-flags method-type)
+               (%get-return-type-char member-name)))))))
+
+(defun %invoke-from-member-name (member-name &rest args)
+  "Invoke a method described by a MemberName with the given ARGS. Core of
+linkToStatic/linkToVirtual/linkToSpecial; resolution is memoized per MemberName.
+Primitive-typed args are unboxed so method references adapted to functional
+interfaces (which pass boxed Object args) reach primitive-parameter methods."
+  (destructuring-bind (kind a b &optional ret-char extra) (%resolve-member-name member-name)
+    (declare (ignore ret-char))
+    (ecase kind
+      (:constructor                     ; a=class metadata, b=init-symbol
+       (%clinit a)
+       (let ((instance (make-instance (intern (name a) (ldk-class-package a)))))
+         (apply b instance (%unbox-args-for-flags extra args))
+         instance))
+      (:static                          ; a=fn-symbol, b=unbox-flags
+       (when extra (%clinit extra))
+       (apply a (%unbox-args-for-flags b args)))
+      (:instance                        ; a=fn-symbol, b=unbox-flags; first arg is the receiver
+       (apply a (if (and args b)
+                    (cons (first args)
+                          (%unbox-args-for-flags b (rest args)))
+                    args))))))
+

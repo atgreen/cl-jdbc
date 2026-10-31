@@ -1,0 +1,793 @@
+;;; -*- Mode: LISP; Syntax: COMMON-LISP; Package: OPENLDK; Base: 10 -*-
+;;;
+;;; Copyright (C) 2024, 2025, 2026  Anthony Green <green@moxielogic.com>
+;;;
+;;; SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+;;;
+;;; This file is part of OpenLDK.
+
+;;; OpenLDK is free software; you can redistribute it and/or modify it
+;;; under the terms of the GNU General Public License as published by
+;;; the Free Software Foundation; either version 3, or (at your
+;;; option) any later version.
+
+;;; OpenLDK is distributed in the hope that it will be useful, but
+;;; WITHOUT ANY WARRANTY; without even the implied warranty of
+;;; MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+;;; General Public License for more details.
+
+;;; You should have received a copy of the GNU General Public License
+;;; along with OpenLDK; see the file COPYING.  If not, please see
+;;; <http://www.gnu.org/licenses/>.
+
+;;; Linking this library statically or dynamically with other modules is
+;;; making a combined work based on this library.  Thus, the terms and
+;;; conditions of the GNU General Public License cover the whole
+;;; combination.
+
+;;; As a special exception, the copyright holders of this library give
+;;; you permission to link this library with independent modules to
+;;; produce an executable, regardless of the license terms of these
+;;; independent modules, and to copy and distribute the resulting
+;;; executable under terms of your choice, provided that you also
+;;; meet, for each linked independent module, the terms and conditions
+;;; of the license of that module.  An independent module is a module
+;;; which is not derived from or based on this library.  If you modify
+;;; this library, you may extend this exception to your version of the
+;;; library, but you are not obligated to do so.  If you do not wish
+;;; to do so, delete this exception statement from your version.
+
+;;; Reflective invocation, CDS, Reference/Finalizer stubs.
+
+(in-package :openldk)
+
+;;; --- Reflective method/constructor invocation (JDK 9+: jdk/internal/reflect) ---
+
+(defun |java/io/ObjectStreamClass.hasStaticInitializer(Ljava/lang/Class;)Z| (java-class)
+  "Inspect the declared initializer without running it or searching superclasses."
+  (let ((class (get-ldk-class-for-java-class java-class)))
+    (if (and class (find "<clinit>" (methods class) :key #'name :test #'string=)) 1 0)))
+
+(defvar *serialization-constructor-classes*
+  (make-hash-table :test #'eq :weakness :key :synchronized t)
+  "Serialization constructors retain their allocation class only while live.")
+
+(defun %serialization-constructor (factory java-class constructor)
+  "Keep the superclass constructor's metadata and allocate JAVA-CLASS on invocation."
+  (declare (ignore factory))
+  (%clinit (get-ldk-class-for-java-class java-class))
+  (let ((copy (|newWithAccessor(Ljdk/internal/reflect/ConstructorAccessor;)Ljava/lang/reflect/Constructor;|
+               constructor nil)))
+    (setf (slot-value copy '|override|) 1
+          (gethash copy *serialization-constructor-classes*) java-class)
+    copy))
+
+(setf (gethash "jdk/internal/reflect/ReflectionFactory.generateConstructor(Ljava/lang/Class;Ljava/lang/reflect/Constructor;)Ljava/lang/reflect/Constructor;"
+               *native-overrides*)
+      #'%serialization-constructor)
+
+(defun %invoke-reflection-target (function arguments)
+  "Wrap exceptions from the target body, after reflection's own checks and initialization."
+  (handler-case (apply function arguments)
+    (|condition-java/lang/Throwable| (condition)
+      (let ((wrapper (%make-java-instance "java/lang/reflect/InvocationTargetException")))
+        (|<init>(Ljava/lang/Throwable;)V| wrapper (slot-value condition '|objref|))
+        (error (%lisp-condition wrapper))))))
+
+(defun %reflection-arguments (parameters arguments)
+  "Return validated arguments without changing the caller's Object array."
+  (let ((count (if parameters (length (java-array-data parameters)) 0))
+        (supplied (if arguments (length (java-array-data arguments)) 0)))
+    (unless (= count supplied)
+      (%throw '|java/lang/IllegalArgumentException| "Wrong number of arguments"))
+    (loop for i below count
+          collect (%reflection-convert-value (jaref arguments i) (jaref parameters i)))))
+
+(defun %reflection-receiver (declaring receiver)
+  "Check an instance member's receiver before inspecting its arguments."
+  (unless receiver (%throw '|java/lang/NullPointerException|))
+  (unless (eql 1 (|isInstance(Ljava/lang/Object;)Z| declaring receiver))
+    (%throw '|java/lang/IllegalArgumentException| "Wrong receiver class"))
+  receiver)
+
+(defun %reflection-instance-target (symbol declaring modifiers method-name descriptor receiver)
+  "Select private/default-access targets using Java overriding, not CLOS specificity.
+Retain every overriding declaration as an anchor for transitive overriding
+(JVMS 5.4.5), including a public bridge hidden by a later default-access method."
+  (if (not (zerop (logand modifiers #x5)))
+      symbol
+      (let* ((base (get-ldk-class-for-java-class declaring))
+             (selected base))
+        (unless (logbitp 1 modifiers)
+          (let ((lineage nil)
+                (anchors (list (cons base modifiers))))
+            (loop for class = (get-ldk-class-for-java-class (|getClass()Ljava/lang/Class;| receiver))
+                    then (and (super class) (%resolve-class (super class) (ldk-loader class)))
+                  while (and class (not (eq class base)))
+                  do (push class lineage))
+            (dolist (class lineage)
+              (let ((candidate
+                      (find-if (lambda (method)
+                                 (and (string= method-name (name method))
+                                      (string= descriptor (descriptor method))
+                                      (zerop (logand (access-flags method) #xa))))
+                               (methods class))))
+                (when (and candidate
+                           (some (lambda (anchor)
+                                   (or (not (zerop (logand (cdr anchor) #x5)))
+                                       (%same-runtime-package-p class (car anchor))))
+                                 anchors))
+                  (push (cons class (access-flags candidate)) anchors)
+                  (setf selected class))))))
+        (let ((owner (intern (name selected) (ldk-class-package selected))))
+          (lambda (&rest arguments) (invoke-special symbol owner arguments))))))
+
+(defun |jdk/internal/reflect/NativeMethodAccessorImpl.invoke0(Ljava/lang/reflect/Method;Ljava/lang/Object;[Ljava/lang/Object;)|
+    (method obj args)
+  "Native reflective method invocation for JDK 9+."
+  (let* ((method-name (lstring (slot-value method '|name|)))
+         (declaring-class (slot-value method '|clazz|))
+         (param-types (slot-value method '|parameterTypes|))
+         (return-type (slot-value method '|returnType|))
+         (modifiers (slot-value method '|modifiers|))
+         (is-static (not (zerop (logand modifiers #x0008))))
+         (descriptor (%build-method-descriptor return-type param-types))
+         (lispized (lispize-method-name (format nil "~A~A" method-name descriptor))))
+    (let* ((class-name (substitute #\/ #\. (lstring (slot-value declaring-class '|name|))))
+           (fn-name (if is-static
+                        (format nil "~A.~A" class-name lispized)
+                        lispized))
+           (pkg (if is-static
+                    (%java-class-package declaring-class)
+                    (find-package :openldk)))
+           (sym (find-symbol fn-name pkg)))
+      (unless (and sym (fboundp sym))
+        (internal-error "Reflective invoke0: method ~A not found (class=~A, static=~A)"
+               fn-name class-name is-static))
+      (if is-static
+          (%clinit (get-ldk-class-for-java-class declaring-class))
+          (%reflection-receiver declaring-class obj))
+      (let* ((lisp-args (%reflection-arguments param-types args))
+             (target (if is-static sym
+                         (%reflection-instance-target sym declaring-class modifiers
+                                                      method-name descriptor obj)))
+             (result (%invoke-reflection-target target (if is-static lisp-args (cons obj lisp-args))))
+             ;; Return descriptor char is the one just past the ')'.
+             (ret-char (char descriptor (1+ (position #\) descriptor)))))
+        ;; Method.invoke returns Object, so a primitive return must be boxed
+        ;; by its declared type: left raw, %box-if-native would make every
+        ;; integral one a Long, and an int annotation member read reflectively
+        ;; (as ByteBuddy does) would not be an Integer.  A boolean (Z) return
+        ;; arrives as OpenLDK's raw false=nil-or-0 / true=1.
+        (case ret-char
+          (#\Z (let ((b (%make-java-instance "java/lang/Boolean")))
+                 (setf (slot-value b '|value|)
+                       (if (or (null result) (eql result 0)) 0 1))
+                 b))
+          (#\V nil)
+          (t (%box-primitive-return result ret-char)))))))
+
+;; JDK 21 uses DirectMethodHandleAccessor$NativeAccessor instead of NativeMethodAccessorImpl
+(defun |jdk/internal/reflect/DirectMethodHandleAccessor$NativeAccessor.invoke0(Ljava/lang/reflect/Method;Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;|
+    (method obj args)
+  "Native reflective method invocation for JDK 21."
+  (|jdk/internal/reflect/NativeMethodAccessorImpl.invoke0(Ljava/lang/reflect/Method;Ljava/lang/Object;[Ljava/lang/Object;)|
+   method obj args))
+
+(defun |jdk/internal/reflect/NativeConstructorAccessorImpl.newInstance0(Ljava/lang/reflect/Constructor;[Ljava/lang/Object;)|
+    (constructor args &optional allocation-class)
+  "Native reflective constructor invocation for JDK 9+."
+  (let* ((declaring-class (slot-value constructor '|clazz|))
+         (param-types (slot-value constructor '|parameterTypes|))
+         (class-name (substitute #\/ #\. (lstring (slot-value declaring-class '|name|))))
+         (descriptor (format nil "(~{~A~})V"
+                             (when param-types
+                               (map 'list #'%class->descriptor-string (java-array-data param-types)))))
+         (lispized (lispize-method-name (format nil "<init>~A" descriptor)))
+         (pkg (find-package :openldk))
+         (sym (find-symbol lispized pkg)))
+    (let* ((allocated-class (or allocation-class declaring-class))
+           (allocated-name (substitute #\/ #\. (lstring (slot-value allocated-class '|name|)))))
+      (%clinit (get-ldk-class-for-java-class allocated-class))
+      (let ((instance (%make-java-instance allocated-name
+                                          (get-ldk-loader-for-java-loader
+                                           (slot-value allocated-class '|classLoader|))))
+            (lisp-args (%reflection-arguments param-types args)))
+        (if (and sym (fboundp sym))
+            (%invoke-reflection-target #'invoke-special
+                                       (list sym (intern class-name (%java-class-package declaring-class))
+                                             (cons instance lisp-args)))
+            (internal-error "Reflective newInstance0: constructor ~A not found for class ~A"
+                   lispized class-name))
+        instance))))
+
+;; JDK 21 routes Constructor.newInstance through this accessor class.
+(defun |jdk/internal/reflect/DirectConstructorHandleAccessor$NativeAccessor.newInstance0(Ljava/lang/reflect/Constructor;[Ljava/lang/Object;)Ljava/lang/Object;|
+    (constructor args)
+  "Invoke a constructor through the JDK 21 direct reflection accessor."
+  (|jdk/internal/reflect/NativeConstructorAccessorImpl.newInstance0(Ljava/lang/reflect/Constructor;[Ljava/lang/Object;)|
+   constructor args))
+
+;; Guard against null dispatch on gnu.bytecode.Type methods.
+;; Kawa's PrimProcedure sometimes has a null retType, causing isVoid() and
+;; getRawType() to be called on nil.
+(defmethod |isVoid()Z| ((obj null))
+  0)
+
+(defmethod |getRawType()| ((obj null))
+  nil)
+
+(defmethod |isCompatibleWithValue(Lgnu/bytecode/Type;)I| ((obj null) other)
+  -1)
+
+(defmethod |isCompatibleWithValue(Lgnu/bytecode/Type;)I| (obj (other null))
+  -1)
+
+;; Fix: Type.make(Class) can fail for primitive types when AbstractWeakHashTable
+;; lookups fail (e.g. due to hash collisions or GC clearing weak references).
+;; Fall back to looking up the well-known primitive Type static fields directly.
+(defmethod |getTypeFor(Ljava/lang/Class;)Lgnu/bytecode/Type;| :around (self jclass)
+  (or (handler-case (call-next-method)
+        (error () nil))
+      (let* ((name (lstring (slot-value jclass '|name|)))
+             (pkg (class-package "gnu/bytecode/Type"))
+             (static-sym (find-symbol "+static-gnu/bytecode/Type+" pkg))
+             (static-holder (when static-sym (ignore-errors (%java-static-value static-sym))))
+             (field-name (cond
+                           ((string= name "void")    "voidType")
+                           ((string= name "int")     "intType")
+                           ((string= name "boolean") "booleanType")
+                           ((string= name "byte")    "byteType")
+                           ((string= name "short")   "shortType")
+                           ((string= name "long")    "longType")
+                           ((string= name "float")   "floatType")
+                           ((string= name "double")  "doubleType")
+                           ((string= name "char")    "charType"))))
+        (when (and field-name static-holder)
+          (let ((field-sym (find-symbol field-name :openldk)))
+            (when (and field-sym (slot-exists-p static-holder field-sym))
+              (slot-value static-holder field-sym)))))))
+
+
+;; java.lang.Class.getGenericSignature0() is a private native returning the
+;; class's generic-signature string (the class-file Signature attribute), or
+;; null when the class is not generic.  Generic reflection needs it: a field's
+;; List<String> is checked against List's type parameters.
+(defmethod |getGenericSignature0()Ljava/lang/String;| ((this |java/lang/Class|))
+  (let* ((lclass (and (eq 0 (|isArray()Z| this))
+                      (eq 0 (|isPrimitive()Z| this))
+                      (get-ldk-class-for-java-class this)))
+         (attributes (and lclass (slot-boundp lclass 'attributes) (attributes lclass)))
+         (signature (and (hash-table-p attributes) (gethash "Signature" attributes))))
+    (and signature (ijstring signature))))
+
+(defmethod |getDeclaredFields0(Z)[Ljava/lang/reflect/Field;| ((this |java/lang/Class|) public-only)
+  (unwind-protect
+       (progn
+         (when *debug-trace*
+           (format t "~&~V@A trace: entering java/lang/Class.getDeclaredFields0(Z)~%" (incf *call-nesting-level* 1) "*"))
+         (unless (gethash "java/lang/reflect/Field" *ldk-classes-by-bin-name*)
+           (|java/lang/Class.forName0(Ljava/lang/String;ZLjava/lang/ClassLoader;Ljava/lang/Class;)Ljava/lang/Class;| (jstring "java/lang/reflect/Field") nil nil nil))
+
+         ;; Get the lclass for THIS (use correct loader)
+         (let ((lclass (get-ldk-class-for-java-class this))
+               (*descriptor-loader* (%class-java-loader this)))
+           ;; Only this class's own fields, as on a JVM: Class.getFields walks
+           ;; the superclasses itself, and a field's annotations are read with
+           ;; its declaring class's constant pool.
+           (labels ((get-fields (lclass)
+                      (when lclass
+                        (progn (loop for field across (or (fields lclass) #())
+                                      ;; When public-only is 1 (true), skip non-public fields
+                                      when (or (zerop public-only)
+                                               (not (zerop (logand #x1 (access-flags field)))))
+                                      collect (let ((f (%make-java-instance "java/lang/reflect/Field")))
+                                                ;; JDK 17: Field(Class, String, Class, int, boolean, int, String, byte[])
+                                                (|<init>(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/Class;IZILjava/lang/String;[B)V|
+                                                 f this (ijstring (name field))
+                                                 ;; Resolve the canonical Class without initializing it.
+                                                 ;; A name-only placeholder has no defining loader or
+                                                 ;; metadata, poisoning clients' reflection caches.
+                                                 (%bin-type-name-to-class (descriptor field))
+                                                 (access-flags field)
+                                                 nil  ; trustedFinal
+                                                 0    ; slot
+                                                 ;; signature (getGenericType) and
+                                                 ;; annotations: picocli's @Option List<String>
+                                                 (let* ((attributes (slot-value field 'attributes))
+                                                        (signature (and (hash-table-p attributes)
+                                                                        (gethash "Signature" attributes))))
+                                                   (and signature (ijstring signature)))
+                                                 (let ((attributes (slot-value field 'attributes)))
+                                                   (and (hash-table-p attributes)
+                                                        (gethash "RuntimeVisibleAnnotations" attributes))))
+                                                f))))))
+
+             (make-java-array
+              :component-class (%get-java-class-by-fq-name "java.lang.reflect.Field")
+              :initial-contents (coerce (get-fields lclass) 'vector)))))
+    (when *debug-trace*
+      (incf *call-nesting-level* -1))))
+
+(defun %field-primitive-char (type-class)
+  "Return the descriptor char (I/J/Z/B/S/C/F/D) for a primitive field
+TYPE-CLASS, or NIL when the field type is a reference type."
+  (when (and type-class (eq 1 (|isPrimitive()Z| type-class)))
+    (let ((n (lstring (slot-value type-class '|name|))))
+      (cond ((string= n "int")     #\I)
+            ((string= n "long")    #\J)
+            ((string= n "boolean") #\Z)
+            ((string= n "byte")    #\B)
+            ((string= n "short")   #\S)
+            ((string= n "char")    #\C)
+            ((string= n "float")   #\F)
+            ((string= n "double")  #\D)
+            (t nil)))))
+
+(defun %field-slot-storage (field obj)
+  "Return the CLOS object holding FIELD's slot: the class's +static-...+
+storage for a static field, otherwise OBJ.  For a static field, first
+initialize the declaring class, as the JVM does before reflective access."
+  (if (not (zerop (logand #x8 (slot-value field '|modifiers|))))
+      (let ((class (get-ldk-class-for-java-class (slot-value field '|clazz|))))
+        (when class
+          (%clinit class))
+        (%unsafe-static-storage field :errorp nil))
+      (%reflection-receiver (slot-value field '|clazz|) obj)))
+
+(defun %check-reflective-access (member object caller &optional constructor-p)
+  "Run the JDK's AccessibleObject access checks before our native accessor.
+The override flag only bypasses checks after setAccessible has authorized it."
+  (unless (eql 1 (slot-value member '|override|))
+    (let* ((declaring (slot-value member '|clazz|))
+           (modifiers (slot-value member '|modifiers|))
+           (target (cond (constructor-p declaring)
+                         ((logbitp 3 modifiers) nil)
+                         (object (|getClass()Ljava/lang/Class;| object))
+                         (t (%throw '|java/lang/NullPointerException|)))))
+      (|checkAccess(Ljava/lang/Class;Ljava/lang/Class;Ljava/lang/Class;I)V|
+       member caller declaring target modifiers))))
+
+;; JDK 25 routes java.lang.reflect.Field.get/set through a MethodHandle-based
+;; field accessor (MethodHandleAccessorFactory). OpenLDK cracks MethodHandle
+;; vmentries directly rather than interpreting LambdaForms, so driving that
+;; accessor NPEs in MethodHandle.asType. Bypass it by reading/writing the CLOS
+;; slot directly. Registered via *native-overrides* (not a defmethod) because
+;; java/lang/reflect/Field is not a build-time CLOS class, so it can't be a
+;; method specializer; the override installs before the JIT compiles the body.
+(defun %reflective-field-get (field obj)
+  (%check-reflective-access field obj (%java-caller-class '%reflective-field-get))
+  (let* ((char (%field-primitive-char (slot-value field '|type$|)))
+         (slot-key (%field-object-slot field))
+         (storage (%field-slot-storage field obj))
+         (raw (if (and storage (slot-exists-p storage slot-key) (slot-boundp storage slot-key))
+                  (slot-value storage slot-key)
+                  (if char 0 nil))))
+    (if char (%box-primitive-return raw char) raw)))
+
+(defun %reflective-field-set (field obj value)
+  (%check-reflective-access field obj (%java-caller-class '%reflective-field-set))
+  (let* ((slot-key (%field-object-slot field))
+         (storage (%field-slot-storage field obj))
+         (v (%reflection-convert-value value (slot-value field '|type$|))))
+    (when (and storage (slot-exists-p storage slot-key))
+      (setf (slot-value storage slot-key) v))
+    nil))
+
+;; Constructor.newInstance on JDK 25 builds a MethodHandle-based constructor
+;; accessor (MethodHandleAccessorFactory.makeConstructorHandle), which NPEs in
+;; MethodHandle.asType under OpenLDK's crack-and-bypass MethodHandle model --
+;; the same failure the Field.get/set bypass above avoids. OpenLDK already has a
+;; native reflective constructor path (NativeConstructorAccessorImpl.newInstance0);
+;; route Constructor.newInstance straight to it so the MethodHandle accessor is
+;; never built. Registered via *native-overrides* because java/lang/reflect/
+;; Constructor is not a build-time CLOS class.
+(defun %reflective-constructor-new-instance (constructor args)
+  (%check-reflective-access constructor nil (%java-caller-class '%reflective-constructor-new-instance) t)
+  (|jdk/internal/reflect/NativeConstructorAccessorImpl.newInstance0(Ljava/lang/reflect/Constructor;[Ljava/lang/Object;)|
+         constructor args (gethash constructor *serialization-constructor-classes*)))
+
+;; Method.invoke has the same JDK 25 problem: acquireMethodAccessor builds a
+;; MethodHandle-based accessor that NPEs in MethodHandle.asType. OpenLDK already
+;; has a native reflective method path (NativeMethodAccessorImpl.invoke0); route
+;; Method.invoke straight to it so the MethodHandle accessor is never built.
+(defun %reflective-method-invoke (method obj args)
+  (%check-reflective-access method obj (%java-caller-class '%reflective-method-invoke))
+  (|jdk/internal/reflect/NativeMethodAccessorImpl.invoke0(Ljava/lang/reflect/Method;Ljava/lang/Object;[Ljava/lang/Object;)|
+         method obj args))
+
+(setf (gethash "java/lang/reflect/Field.get(Ljava/lang/Object;)Ljava/lang/Object;" *native-overrides*)
+      #'%reflective-field-get)
+
+(setf (gethash "java/lang/reflect/Field.set(Ljava/lang/Object;Ljava/lang/Object;)V" *native-overrides*)
+      #'%reflective-field-set)
+
+(setf (gethash "java/lang/reflect/Constructor.newInstance([Ljava/lang/Object;)Ljava/lang/Object;" *native-overrides*)
+      #'%reflective-constructor-new-instance)
+
+(setf (gethash "java/lang/reflect/Method.invoke(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;" *native-overrides*)
+      #'%reflective-method-invoke)
+
+(defun |sun/misc/VM.initialize()| ()
+  nil)
+
+(defun |jdk/internal/misc/VM.initialize()V| ()
+  ;; JDK 9+ version
+  nil)
+
+;; VM.isModuleSystemInited returns (initLevel >= 2).  OpenLDK only runs
+;; System.initPhase1 (VM.initLevel 1), so this is false and blocks features
+;; that gate on it -- notably java.lang.reflect.Proxy$ProxyBuilder, which
+;; throws InternalError "Proxy is not supported until module system is fully
+;; initialized". Runtime setup constructs the boot module graph before
+;; application code runs; report initialization except while building it.
+(setf (gethash "jdk/internal/misc/VM.isModuleSystemInited()Z" *native-overrides*)
+      (lambda () (if *boot-module-layer-initializing* 0 1)))
+
+;; Likewise VM.isBooted (initLevel 4).  ServiceLoader, before the VM has
+;; booted, serves only java.base code; once booted it lets any caller whose
+;; module can use the service (an unnamed module can use them all), such as
+;; the application's (kotlin-reflect's ServiceLoader.load).
+(setf (gethash "jdk/internal/misc/VM.isBooted()Z" *native-overrides*)
+      (lambda () 1))
+
+;; Build the JDK's actual module descriptors, reads, exports, and layer.
+(setf (gethash "java/lang/ModuleLayer.boot()Ljava/lang/ModuleLayer;" *native-overrides*)
+      #'%boot-module-layer)
+
+;; Reporting the module system as inited (above) has one side effect worth
+;; neutralizing: StackTraceElement.isHashedInJavaBase() short-circuits to false
+;; when the module system is NOT inited, but otherwise consults
+;; StackTraceElement$HashedModules -- which walks the boot module layer and NPEs
+;; under OpenLDK (no real module graph).  computeFormat() runs on every
+;; StackTraceElement, so this would break all getStackTrace() formatting.  Force
+;; it back to false: OpenLDK does not hash modules, so no frame is "in java.base"
+;; for STE-formatting purposes.
+(setf (gethash "java/lang/StackTraceElement.isHashedInJavaBase(Ljava/lang/Module;)Z" *native-overrides*)
+      (lambda (module) (declare (ignore module)) 0))
+
+;; JDK 17: SharedSecrets.getJavaLangAccess().getEnumConstantsShared(Class)
+;; getJavaLangAccess() returns nil in our VM, so this is dispatched as a plain
+;; function call with nil as 'this' and the enum Class as the argument.
+(defmethod |getEnumConstantsShared(Ljava/lang/Class;)[Ljava/lang/Enum;| (this enum-class)
+  (declare (ignore this))
+  ;; Call the enum's values() static method to get its constants array
+  (let* ((ldk-class (get-ldk-class-for-java-class enum-class)))
+    (when ldk-class
+      (let ((values-fn-name (format nil "~A.values()[L~A;" (name ldk-class) (name ldk-class))))
+        (let ((fn (find-symbol values-fn-name :openldk)))
+          (when (and fn (fboundp fn))
+            (funcall fn)))))))
+
+;;; JDK 9+ Class Data Sharing stubs
+(defun |jdk/internal/misc/CDS.isDumpingClassList0()| () 0)
+(defun |jdk/internal/misc/CDS.isDumpingArchive0()| () 0)
+(defun |jdk/internal/misc/CDS.isSharingEnabled0()| () 0)
+;; JDK 25: the individual CDS flag natives were folded into a single bitmask.
+;; Returning 0 means no CDS features are active, which is what we want.
+(defun |jdk/internal/misc/CDS.getCDSConfigStatus()I| () 0)
+(defun |jdk/internal/misc/CDS.initializeFromArchive(Ljava/lang/Class;)V| (class)
+  (declare (ignore class)) nil)
+(defun |jdk/internal/misc/CDS.defineArchivedModules(Ljava/lang/ClassLoader;Ljava/lang/ClassLoader;)V| (a b)
+  (declare (ignore a b)) nil)
+(defun |jdk/internal/misc/CDS.getRandomSeedForDumping()J| () 0)
+
+;;; JDK 9+ Reference handling native stubs
+(defun |java/lang/ref/Reference.waitForReferencePendingList()V| () nil)
+(defun |java/lang/ref/Reference.getAndClearReferencePendingList()Ljava/lang/ref/Reference;| () nil)
+(defun |java/lang/ref/Reference.hasReferencePendingList()Z| () 0)
+
+;;; OpenLDK supplies reference delivery in native/references.lisp instead of
+;;; starting the JDK ReferenceHandler and Finalizer threads. Supply the shared
+;;; access object during initPhase1; its wait method drains discovered references.
+
+(defclass %java-lang-ref-access-stub (|java/lang/Object|) ())
+
+(defvar *java-lang-ref-access-stub* (make-instance '%java-lang-ref-access-stub))
+
+(defmethod |startThreads()V| ((this %java-lang-ref-access-stub))
+  nil)
+
+(defmethod |runFinalization()V| ((this %java-lang-ref-access-stub))
+  nil)
+
+(setf (gethash "jdk/internal/access/SharedSecrets.getJavaLangRefAccess()Ljdk/internal/access/JavaLangRefAccess;"
+               *native-overrides*)
+      (lambda () *java-lang-ref-access-stub*))
+
+;;; Finalizer native stubs
+(defun |java/lang/ref/Finalizer.isFinalizationEnabled()Z| ()
+  "JDK 21: returns whether finalization is enabled. Always true for OpenLDK."
+  1)
+
+(defun |java/lang/ref/Finalizer.reportComplete(Ljava/lang/Object;)V| (obj)
+  (declare (ignore obj)) nil)
+
+(defmethod |compareAndSwapObject(Ljava/lang/Object;JLjava/lang/Object;Ljava/lang/Object;)Z| ((unsafe |sun/misc/Unsafe|) obj field-id expected-value new-value)
+  (bordeaux-threads:with-recursive-lock-held (*cas-lock*)
+  (cond
+    ((typep obj 'java-array)
+     (let ((index (%unsafe-array-index obj field-id)))
+       (if (equal (jaref obj index) expected-value)
+         (progn
+           (setf (jaref obj index) new-value)
+           1)
+           0)))
+    ((null obj)
+     ;; Unsafe represents a static field as a null base plus a synthetic
+     ;; offset in OpenLDK.  Go through the ordinary accessors so that the
+     ;; declaring class's static storage object is selected.
+     (if (equal (|getObject(Ljava/lang/Object;J)Ljava/lang/Object;| unsafe obj field-id)
+                expected-value)
+         (progn
+           (|putObject(Ljava/lang/Object;JLjava/lang/Object;)V|
+            unsafe obj field-id new-value)
+           1)
+         0))
+    (t
+     (let ((key (%unsafe-slot-key field-id)))
+       (if (equal (slot-value obj key) expected-value)
+           (progn
+             (setf (slot-value obj key) new-value)
+             1)
+           0))))))
+
+(defmethod |compareAndSwapInt(Ljava/lang/Object;JII)Z| ((unsafe |sun/misc/Unsafe|) obj field-id expected-value new-value)
+  (bordeaux-threads:with-recursive-lock-held (*cas-lock*)
+  ;; FIXME: use atomics package
+  (if (typep obj 'java-array)
+      (let ((index (%unsafe-array-index obj field-id)))
+        (if (equal (jaref obj index) expected-value)
+            (progn
+              (setf (jaref obj index) new-value)
+              1)
+            0))
+      (if (null obj)
+      (if (equal (|getInt(Ljava/lang/Object;J)I| unsafe obj field-id)
+                 expected-value)
+          (progn
+            (|putInt(Ljava/lang/Object;JI)V| unsafe obj field-id new-value)
+            1)
+          0)
+      (let ((key (%unsafe-slot-key field-id)))
+        (if (equal (slot-value obj key) expected-value)
+            (progn
+              (setf (slot-value obj key) new-value)
+              1)
+            0))))))
+
+(defmethod |compareAndSwapLong(Ljava/lang/Object;JJJ)Z| ((unsafe |sun/misc/Unsafe|) obj field-id expected-value new-value)
+  (bordeaux-threads:with-recursive-lock-held (*cas-lock*)
+  (if (typep obj 'java-array)
+      (let ((index (%unsafe-array-index obj field-id)))
+        (if (equal (jaref obj index) expected-value)
+            (progn
+              (setf (jaref obj index) new-value)
+              1)
+            0))
+      (if (null obj)
+      (if (equal (|getLong(Ljava/lang/Object;J)J| unsafe obj field-id)
+                 expected-value)
+          (progn
+            (|putLong(Ljava/lang/Object;JJ)V| unsafe obj field-id new-value)
+            1)
+          0)
+          (|compareAndSwapInt(Ljava/lang/Object;JII)Z|
+           unsafe obj field-id expected-value new-value)))))
+
+(defmethod |getObjectVolatile(Ljava/lang/Object;J)Ljava/lang/Object;| ((unsafe |sun/misc/Unsafe|) obj l)
+  (cond
+    ((typep obj 'java-array)
+     (jaref obj (%unsafe-array-index obj l)))
+    ((typep obj '|java/lang/Object|)
+     (slot-value obj (%unsafe-slot-key l)))
+    ((null obj)
+     ;; FIXME: check that the field is STATIC
+     (slot-value (%unsafe-static-storage (gethash l *field-offset-table*))
+                 (%unsafe-slot-key l)))
+    (t (internal-error "unrecognized object type in getObjectVolatile: ~A" obj))))
+
+(defmethod |putObjectVolatile(Ljava/lang/Object;JLjava/lang/Object;)V| ((unsafe |sun/misc/Unsafe|) obj l value)
+  (cond
+    ((typep obj 'java-array)
+     (setf (jaref obj (%unsafe-array-index obj l)) value))
+    ((typep obj '|java/lang/Object|)
+     (setf (slot-value obj (%unsafe-slot-key l)) value))
+    ((null obj)
+     ;; Static field access
+     (setf (slot-value (%unsafe-static-storage (gethash l *field-offset-table*))
+                       (%unsafe-slot-key l))
+           value))
+    (t (internal-error "unrecognized object type in putObjectVolatile: ~A" obj))))
+
+;; getObject - same as getObjectVolatile for OpenLDK (no volatile semantics needed in Lisp)
+(defmethod |getObject(Ljava/lang/Object;J)Ljava/lang/Object;| ((unsafe |sun/misc/Unsafe|) obj l)
+  (cond
+    ((typep obj 'java-array)
+     (jaref obj (%unsafe-array-index obj l)))
+    ((typep obj '|java/lang/Object|)
+     (slot-value obj (%unsafe-slot-key l)))
+    ((null obj)
+     ;; FIXME: check that the field is STATIC
+     (let ((field (gethash l *field-offset-table*)))
+       (when field
+         (let ((static-obj (%unsafe-static-storage field :errorp nil))
+               (key (%unsafe-slot-key l)))
+           (when (and static-obj (slot-boundp static-obj key))
+             (slot-value static-obj key))))))
+    (t (internal-error "unrecognized object type in getObject: ~A" obj))))
+
+(defmethod |getLongVolatile(Ljava/lang/Object;J)J| ((unsafe |sun/misc/Unsafe|) obj l)
+  (cond
+    ((typep obj 'java-array)
+     (jaref obj (%unsafe-array-index obj l)))
+    ((typep obj '|java/lang/Object|)
+     (slot-value obj (%unsafe-slot-key l)))
+    (t (internal-error "unrecognized object type in getLongVolatile: ~A" obj))))
+
+(defmethod |putObject(Ljava/lang/Object;JLjava/lang/Object;)V| ((unsafe |sun/misc/Unsafe|) obj l value)
+  (cond
+    ((typep obj 'java-array)
+     (setf (jaref obj (%unsafe-array-index obj l)) value))
+    ((typep obj '|java/lang/Object|)
+     (setf (slot-value obj (%unsafe-slot-key l)) value))
+    ((null obj)
+     ;; Static field access
+     (setf (slot-value (%unsafe-static-storage (gethash l *field-offset-table*))
+                       (%unsafe-slot-key l))
+           value))
+    (t (internal-error "unrecognized object type in putObject: ~A" obj))))
+
+(defmethod |putOrderedObject(Ljava/lang/Object;JLjava/lang/Object;)V| ((unsafe |sun/misc/Unsafe|) obj l value)
+  (|putObject(Ljava/lang/Object;JLjava/lang/Object;)V| unsafe obj l value))
+
+;;; JDK 9+ renamed native methods -- contain actual implementations to avoid
+;;; infinite recursion with compiled bytecode that delegates old→new names.
+
+(defmethod |getReference(Ljava/lang/Object;J)Ljava/lang/Object;| ((unsafe |sun/misc/Unsafe|) obj l)
+  (cond
+    ((typep obj 'java-array) (jaref obj (%unsafe-array-index obj l)))
+    ((typep obj '|java/lang/Object|)
+     (slot-value obj (%unsafe-slot-key l)))
+    ((null obj)
+     (let ((field (gethash l *field-offset-table*)))
+       (when field
+         (let ((static-obj (%unsafe-static-storage field :errorp nil))
+               (key (%unsafe-slot-key l)))
+           (when (and static-obj (slot-boundp static-obj key))
+             (slot-value static-obj key))))))
+    (t nil)))
+
+(defmethod |putReference(Ljava/lang/Object;JLjava/lang/Object;)V| ((unsafe |sun/misc/Unsafe|) obj l value)
+  (cond
+    ((typep obj 'java-array)
+     (setf (jaref obj (%unsafe-array-index obj l)) value))
+    ((typep obj '|java/lang/Object|)
+     (setf (slot-value obj (%unsafe-slot-key l)) value))
+    ((null obj)
+     (setf (slot-value (%unsafe-static-storage (gethash l *field-offset-table*))
+                       (%unsafe-slot-key l))
+           value))
+    (t nil)))
+
+(defmethod |getReferenceVolatile(Ljava/lang/Object;J)Ljava/lang/Object;| ((unsafe |sun/misc/Unsafe|) obj l)
+  (|getReference(Ljava/lang/Object;J)Ljava/lang/Object;| unsafe obj l))
+
+(defmethod |putReferenceVolatile(Ljava/lang/Object;JLjava/lang/Object;)V| ((unsafe |sun/misc/Unsafe|) obj l value)
+  (|putReference(Ljava/lang/Object;JLjava/lang/Object;)V| unsafe obj l value))
+
+(defmethod |putReferenceRelease(Ljava/lang/Object;JLjava/lang/Object;)V| ((unsafe |sun/misc/Unsafe|) obj l value)
+  (|putReference(Ljava/lang/Object;JLjava/lang/Object;)V| unsafe obj l value))
+
+(defmethod |getReferenceAcquire(Ljava/lang/Object;J)Ljava/lang/Object;| ((unsafe |sun/misc/Unsafe|) obj l)
+  (|getReference(Ljava/lang/Object;J)Ljava/lang/Object;| unsafe obj l))
+
+(defun |java/security/AccessController.getStackAccessControlContext()| ()
+  ;; NIL means "privileged context"; fine with the SecurityManager gone.
+  nil)
+
+(defun |java/security/AccessController.ensureMaterializedForStackWalk(Ljava/lang/Object;)| (obj)
+  "JDK 17 no-op: prevents JIT from optimizing away references during stack walks."
+  (declare (ignore obj))
+  nil)
+
+;; ---------------------------------------------------------------------------
+;; JDK 25: SystemProps$Raw native methods for System.initPhase1()
+;; platformProperties() returns a String[FIXED_LENGTH] indexed by the _NDX
+;; constants declared in jdk.internal.util.SystemProps.Raw. The index order
+;; changed relative to JDK 17/21 (file.encoding was replaced by native.encoding,
+;; and stdin/stdout/stderr encodings were added), so FIXED_LENGTH is now 40.
+;; vmProperties() returns String[] of key-value pairs (like -D properties).
+
+
+;; The descriptor of the type a java.lang.Class stands for: I, [J,
+;; Ljava/lang/String;.
+(defun %class-descriptor (java-class)
+  (let ((name (lstring (slot-value java-class '|name|))))
+    (cond
+      ((char= (char name 0) #\[) (substitute #\/ #\. name))
+      ((string= name "int") "I")
+      ((string= name "long") "J")
+      ((string= name "boolean") "Z")
+      ((string= name "byte") "B")
+      ((string= name "short") "S")
+      ((string= name "char") "C")
+      ((string= name "float") "F")
+      ((string= name "double") "D")
+      ((string= name "void") "V")
+      (t (format nil "L~A;" (substitute #\/ #\. name))))))
+
+(defun %executable-method (executable)
+  "The class-file method a java.lang.reflect.Method or Constructor
+reflects."
+  (let* ((lclass (get-ldk-class-for-java-class (slot-value executable '|clazz|)))
+         (name (if (slot-exists-p executable '|name|)
+                   (lstring (slot-value executable '|name|))
+                   "<init>"))
+         (parameters (format nil "(~{~A~})"
+                             (map 'list #'%class-descriptor
+                                  (java-array-data (slot-value executable '|parameterTypes|))))))
+    (when lclass
+      (find-if (lambda (method)
+                 (and (string= (name method) name)
+                      (starts-with? parameters (descriptor method))))
+               (methods lclass)))))
+
+;; Executable.getParameters0() returns the parameters the MethodParameters
+;; attribute names, or null for a method without one (compiled without
+;; -parameters), which makes Executable.getParameters() synthesize arg0,
+;; arg1, ... as a JVM does.
+(defmethod |getParameters0()[Ljava/lang/reflect/Parameter;| (this)
+  (let* ((method (%executable-method this))
+         (parameters (and method (gethash "MethodParameters" (attributes method)))))
+    (when parameters
+      (make-java-array
+       :component-class (%get-java-class-by-bin-name "java/lang/reflect/Parameter")
+       :initial-contents
+       (loop for (name . access-flags) in parameters
+             for index from 0
+             collect (let ((parameter (%make-java-instance "java/lang/reflect/Parameter")))
+                       (|<init>(Ljava/lang/String;ILjava/lang/reflect/Executable;I)V|
+                        parameter (and name (ijstring name)) access-flags this index)
+                       parameter))))))
+
+(defun %record-components (java-class)
+  (let ((lclass (and (eq 0 (|isArray()Z| java-class))
+                     (eq 0 (|isPrimitive()Z| java-class))
+                     (get-ldk-class-for-java-class java-class))))
+    (and lclass
+         (hash-table-p (attributes lclass))
+         (gethash "Record" (attributes lclass)))))
+
+(defun %record-class-p (java-class)
+  "A final Record subclass with a Record attribute, even with zero components."
+  (let ((class (get-ldk-class-for-java-class java-class)))
+    (and class (equal (super class) "java/lang/Record")
+         (logbitp 4 (access-flags class))
+         (nth-value 1 (gethash "Record" (attributes class))))))
+
+(defmethod |isRecord0()Z| ((this |java/lang/Class|))
+  (if (%record-class-p this) 1 0))
+
+;; A RecordComponent per component of the Record attribute, its accessor
+;; the record's public no-argument method of the component's name.
+(defmethod |getRecordComponents0()[Ljava/lang/reflect/RecordComponent;| ((this |java/lang/Class|))
+  (unless (%record-class-p this) (return-from |getRecordComponents0()[Ljava/lang/reflect/RecordComponent;| nil))
+  (classload "java/lang/reflect/RecordComponent")
+  (let ((*descriptor-loader* (%class-java-loader this))
+        (no-classes (make-java-array :component-class (%get-java-class-by-bin-name "java/lang/Class"))))
+    (make-java-array
+     :component-class (%get-java-class-by-bin-name "java/lang/reflect/RecordComponent")
+     :initial-contents
+     (loop for (name descriptor attributes) in (%record-components this)
+           collect (let ((component (%make-java-instance "java/lang/reflect/RecordComponent"))
+                         (signature (gethash "Signature" attributes)))
+                     (setf (slot-value component '|clazz|) this
+                           (slot-value component '|name|) (ijstring name)
+                           (slot-value component '|type$|) (%bin-type-name-to-class descriptor)
+                           (slot-value component '|accessor|)
+                           (|getDeclaredMethod(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;|
+                            this (ijstring name) no-classes)
+                           (slot-value component '|signature|) (and signature (ijstring signature))
+                           (slot-value component '|annotations|) (gethash "RuntimeVisibleAnnotations" attributes))
+                     component)))))

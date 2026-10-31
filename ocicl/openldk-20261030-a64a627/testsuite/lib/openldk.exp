@@ -1,0 +1,50 @@
+
+
+# Compiler command for building testsuite sources. Decoupled from JAVA_HOME (a
+# headless JDK has no javac); honours the JAVAC environment variable, defaulting
+# to a javac targeting release 25 (class-file version 69, which OpenLDK accepts).
+proc openldk_javac {} {
+    set jc [getenv "JAVAC"]
+    if {$jc == ""} { set jc "javac --release 25" }
+    return $jc
+}
+
+# Exact, case-sensitive test identities. Never grep test names as regexps or
+# search historical CI log fragments for an expected-failure decision.
+proc is_expected_failure { testcase } {
+    global openldk_expected_failures
+    if {![info exists openldk_expected_failures]} {
+        set openldk_expected_failures [dict create]
+        set input [open "expected-failures.txt" r]
+        while {[gets $input line] >= 0} {
+            if {[regexp {^(?:FAIL|XFAIL): (.+) execution test$} $line -> name]} {
+                if {[dict exists $openldk_expected_failures $name]} { error "Duplicate expected failure: $name" }
+                dict set openldk_expected_failures $name 1
+            } elseif {[string trim $line] != "" && ![string match "#*" $line]} {
+                error "Malformed expected-failures.txt entry: $line"
+            }
+        }
+        close $input
+    }
+    return [dict exists $openldk_expected_failures $testcase]
+}
+
+proc unsupported_test_reason { testcase } {
+    global openldk_unsupported_tests
+    if {![info exists openldk_unsupported_tests]} {
+        set openldk_unsupported_tests [dict create]
+        set input [open "unsupported-tests.txt" r]
+        while {[gets $input line] >= 0} {
+            if {$line != "" && ![string match "#*" $line]} {
+                set columns [split $line "\t"]
+                if {[llength $columns] != 3} { error "Malformed unsupported-tests.txt entry: $line" }
+                dict set openldk_unsupported_tests [lindex $columns 0] [lrange $columns 1 end]
+            }
+        }
+        close $input
+    }
+    if {[dict exists $openldk_unsupported_tests $testcase]} {
+        return [dict get $openldk_unsupported_tests $testcase]
+    }
+    return ""
+}

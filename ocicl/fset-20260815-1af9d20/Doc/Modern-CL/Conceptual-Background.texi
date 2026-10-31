@@ -1,0 +1,343 @@
+@ignore
+
+© 2026 Scott L. Burson
+
+This document is published under the Creative Commons
+@uref{https://creativecommons.org/licenses/by-nc-sa/4.0/, CC BY-NC-SA 4.0} license.  This license
+enables reusers to distribute, remix, adapt, and build upon the material in any medium or format for
+noncommercial purposes only, and only so long as attribution is given to the creator.  If you remix,
+adapt, or build upon the material, you must license the modified material under identical terms.
+@end ignore
+
+@node Conceptual Background
+@chapter Conceptual Background
+
+This chapter makes some observations about types in programming languages that, frankly, I think all
+programmers should be familiar with.  I encourage everyone to read it.
+
+@hrule{}
+
+
+@c ================================================================================
+@node What Is a Functional Datatype?
+@section What Is a Functional Datatype?
+
+You may have noticed that I refer to FSet collections as ``functional'' rather than ``immutable''.
+There is more to functional semantics than mere immutability: functional collections also support
+``functional update'' operations: operations that take a collection and return a new collection that
+is different in some specified way.  Some ``immutable'' collections libraries do not provide these.
+
+Functional collections are therefore also @dfn{persistent}, in the
+@uref{https://en.wikipedia.org/wiki/Persistent_data_structure, data-structure sense}: since
+performing a functional update returns a new collection, the collection in its previous state still
+exists and can be operated on further if desired.  (The term ``persistent'' is also used for data
+written to nonvolatile storage; this meaning is not intended here.)
+
+To develop an exact definition of functional collections, or functional datatypes in general, let me
+start with some simple examples in C++ and Java.  The first could be in either language:
+
+@example
+    int a = 3;
+    int b = a;
+    ++a;     // b is unchanged
+@end example
+
+Simple, right?  Everyone knows that incrementing @code{a} doesn't affect @code{b}.  This is because
+the type @code{int} has an @dfn{immediate} implementation: there is no way that @code{b} could be an
+@emph{alias} of @code{a}, because the assignment copies the value itself, not a pointer to the
+value.  We say that @code{int} has @dfn{value semantics}.
+
+Now consider this, in Java:
+
+@example
+    int[] a = @{ 3 @};
+    int[] b = a;
+    a[0] = 4;    // b is also affected
+@end example
+
+Here we see a case where assignment creates an alias to a mutable object, so that mutations to the
+object are visible through the alias.  This example demonstrates @dfn{reference semantics}.
+
+Interestingly, to have reference semantics, a type must be aliasing (meaning that assignment creates
+an alias) @emph{and} mutable.  C++, for instance, has collection types that are mutable but not
+aliasing:
+
+@example
+    std::vector<int> a@{3@};
+    std::vector<int> b = a;
+    a[0] = 4;   // b is unchanged!
+@end example
+
+Why is @code{b} not an alias of @code{a}?  Because @code{std::vector} redefines assignment to copy
+the contents.  So even though the implementation is @dfn{pointer-mediated} --- as opposed to
+immediate, like @code{int} --- the class arranges for assignment not to create an alias.  (Of
+course, this being C++, you could create an alias using an explicit reference or pointer, but let's
+leave that aside.  And yes, C++ pedants, I am overlooking the distinction between initialization and
+assignment, which doesn't matter for this discussion.)
+
+Curiously enough, the result is that (in the absence of explicit references or pointers) the
+standard C++ collections have value semantics despite being mutable!  I said above that the Java
+@code{int[]} example shows a case where assignment creates an alias to a mutable object.  Here we
+see that both aspects are required: the type must be aliasing @emph{and} mutable to have reference
+semantics; otherwise, it has value semantics.
+
+Let's have another look at that first example:
+
+@example
+    int a = 3;
+    int b = a;
+    ++a;     // b is unchanged
+@end example
+
+How do we want to describe the action performed by the third statement?  The usual way is to say
+that @code{++a} is an abbreviation for @code{a = a + 1}; and that's valid.  But interestingly, it's
+equally valid to consider @code{int} to be a mutable but unaliasing type, like @code{std::vector}.
+We could just as well say that the increment operation is mutating @code{a} in place; in fact,
+that's often how we think about it, and it's also very likely to be how it's implemented at the
+machine-instruction level.  We see, then, that if a type is unaliasing, the mutable/immutable
+distinction no longer has the force we expect: it no longer determines whether the type has
+reference or value semantics.
+
+So the first requirement for a @dfn{functional} datatype is simply that it have value semantics.
+@c &&& My intention here is to define a functional datatype as one appropriate for functional
+@c programming.  Value semantics is necessary, but it also needs an efficiently persistent
+@c implementation and (if immutable) well-chosen functional update operators.  I should explain the
+@c term ``functional update'' here too.  (Or call these ``delta operators''??)
+
+Okay, back to Common Lisp and FSet.  Collections have to have pointer-mediated implementations
+because they're of arbitrary size, and Common Lisp gives us no way to redefine assignment.  So
+aliasing is forced on us.  (This is true of most languages.)  To get value semantics, then, the FSet
+types must be immutable.  As we will see, though, FSet provides operations that superficially
+resemble mutations; in practice, you can mentally pretend that FSet types are mutable but
+unaliasing, like @code{std::vector}, although that's not how they're actually implemented --- the
+apparently mutating operations are constructing a new representation and assigning it back to the
+variable holding the collection.
+
+If that sounds odd to you as a CL programmer, let me assure you that it is not.  Consider this
+example:
+
+@example
+    (let* ((a (list 4))
+          (b a))
+      (push 3 a))   ; b is unchanged
+@end example
+
+Here the @code{push} form expands to @code{(setq a (cons 3 a))}, which obviously doesn't touch
+@code{b}.  Although Lisp lists are technically a reference type, since cons cells can be mutated, in
+practice they are rarely mutated once they are fully constructed.  (By ``fully constructed'' I'm
+referring to the fact that lists are often built backwards and then reversed in place with
+@code{nreverse}; usually, once that reversal is done, the list is fully constructed.)  So Lisp lists
+are almost always used as a functional type, and the language supports this usage fairly well.
+
+
+@c ================================================================================
+@node Is Lisp a Functional Language?
+@section Is Lisp a Functional Language?
+
+Lisp is often referred to as one of the earliest functional languages, but the way the term
+``functional'' is used has shifted over time.  Where it once referred to a language with first-class
+functions --- functions that can be assigned to variables and passed to and returned from other
+functions --- now, languages called ``functional'' are often @emph{pure} functional, that is,
+languages with no side-effects at all, such as Haskell.
+
+Also, when I refer to first-class functions, I should probably be putting ``functions'' in quotes.
+What we are used to calling functions in Lisp and many other languages are more correctly called
+procedures; they aren't functions in the mathematical sense, as they often have side-effects.
+
+I like to refer to Lisp as ``semi-functional''.  For programming in the small, Lisp allows code to
+be written functionally; of course, the whole point of FSet is to greatly expand the amount of such
+code that can be written.  But on a larger scale, Lisp programs tend to have some amount of state
+that gets updated as well.
+
+There are many languages in this ``semi-functional'' category: Scala, the ML family --- even Python
+can be used this way.
+
+I want to digress a bit here to ask a different question: can a program be considered functional if
+it uses local variable assignment?  In my view, yes: if the only side-effects it performs are
+assignments to local variables, for most purposes it can be considered functional code.
+
+At the machine-code level, after all, everything is side-effects: even a pure function in Haskell
+has to allocate and initialize a stack frame and store computed values in it, or at the @emph{very}
+least, modify machine registers.  We refer to a procedure as ``pure'' when it doesn't have any
+side-effects that are detectable @emph{at the level of the language semantics}.  But a procedure
+that assigns to local variables, but performs no other mutating operation, similarly lacks
+side-effects that are detectable by its callers.
+
+In fact, there exists an algorithm, the subject of
+@uref{https://homes.cs.washington.edu/~mernst/pubs/vdg-popl94.pdf, this 1994 paper} by Dan Weise
+@i{et al.}, that can take a procedure written with local assignment and mechanically convert it to a
+functional form.  (The paper doesn't describe its algorithm in those terms, but close examination
+will reveal that the Value Dependence Graph is easily reinterpreted as a functional form of the
+input program.)
+
+So although it can be a fun exercise to write an algorithm without assignment, typically using tail
+recursion instead, I don't think you're necessarily giving up on functional programming if you
+prefer to write with some local assignments.  This point will be worth keeping in mind when we turn
+to @ref{Quasi-Mutating Operators}.
+
+
+@c ================================================================================
+@node A Brief Introduction to Big-O
+@section A Brief Introduction to Big-O
+
+This book uses ``Big-O'' notation to characterize the time complexity of operations.  While most
+readers are probably familiar with it, a few may not be; I thought I should go over the basics.  You
+should definitely skip this section if you have studied the topic.
+
+Time complexity --- more accurately, @emph{asymptotic} time complexity --- is a way to characterize
+how the worst-case running time of an algorithm grows with the size of its input, as that input gets
+arbitrarily large.  It is not the only important measure of performance!  If you have two
+implementations of an algorithm, one of which always takes 100 times longer than the other ---
+perhaps it is running on a very slow interpreter --- these two implementations nonetheless have the
+same time complexity.  Time complexity abstracts away from these constant-factor differences to
+focus on the dependence of running time on input size.
+
+Imagine, for example, that there is some function we want to compute on collections of some kind,
+and that we have two algorithms to do it.  Algorithm A works by performing some simple operation on
+every pair of elements of the input.  If the collection is of size @i{n}, there are @i{n}@sup{2}
+such pairs; so the time taken by this algorithm must grow proportionally to that number.  Algorithm
+B performs a more complex operation on every element by itself; let's suppose that this more complex
+operation takes time independent of the size of the collection; so the time taken by the algorithm
+is proportional to @i{n}.
+
+Even if algorithm A is faster for small inputs --- even if it's @emph{much} faster --- the fact that
+its running time grows as the square of the size of the input means that there @emph{must} exist an
+input large enough that algorithm B will beat A on that input; and as the input gets larger yet,
+algorithm B's advantage will only grow.
+
+We say that algorithm A has quadratic or O(@i{n}@sup{2}) time complexity, and B has linear or
+O(@i{n}) time complexity.  Some commonly encountered complexity classes --- including the ones used
+in this book --- are, in increasing order:
+
+@table @asis
+@item constant, O(1)
+The running time is independent of the size of the input.
+
+@item logarithmic, O(log @i{n})
+The running time is proportional to the logarithm of the size of the input.  Note that the base of
+the logarithm doesn't matter, because logarithms of different bases are related by a constant
+factor, and time complexity abstracts away constant factors.
+
+It is common for algorithms to have logarithmic time complexity when they involve splitting the
+input into roughly-equally-sized partitions, selecting one of those, and repeating until the current
+partition picks out a single element.  A familiar example is binary search on a sorted vector, which
+maintains a range of indices within which the value being searched for must lie if present; at each
+iteration, it compares the item at the center of that range against the search key, and based on the
+result of that comparison, discards the top or bottom half of the range.  Finding a path through an
+ordered binary tree similarly discards half the remaining tree at each step.
+
+@item linear, O(@i{n})
+The running time grows at the same rate as the size of the input.  Algorithms that perform an
+operation on every element of the input must have at least linear time complexity.
+
+@item linearithmic, O(@i{n} log @i{n})
+The running time grows as the size of the input times its logarithm, that is, slightly faster than
+linearly.  Algorithms that perform an operation on every element of the input, where the time for
+that operation is logarithmic in the size, will have this time complexity.  Many sorting algorithms
+are in this class.
+
+@item quadratic, O(@i{n}@sup{2})
+The running time grows as the square of the size of the input.
+@end table
+
+@emph{Most} of the time, in practice, constant-time operations are very fast --- they could require
+as little as one machine instruction --- and logarithmic-time operations are fast enough not to
+worry about.  Linear time is generally acceptable for bulk operations, and linearithmic (O(@i{n} log
+@i{n})) time isn't much worse --- again, the difference is rarely worth worrying about.  And these
+tend to be the best time complexities possible for many bulk operations (e.g. sorting), anyway.
+Quadratic time has the potential to be a problem, though in practice, people do live with quadratic
+or even cubic (O(@i{n}@sup{3})) algorithms when nothing better is available.  Beyond that are all
+the higher-order polynomials, and then exponential time (O(@i{k}@sup{@i{n}}) for some constant
+@i{k}) --- these are considered increasingly intractable.
+
+Again, time complexity is not all there is to performance; there are situations where
+constant-factor differences are more important.  But usually, time complexity is the first
+consideration, because when programs are put to actual use, there tend to be at least a few users
+who run them on very large inputs.
+
+One more point, about the word ``asymptotic'': this refers to the time taken by the algorithm as the
+input size grows @emph{without bound}.  So it's not something you can measure, because all
+measurements must be made with specific, finite inputs.  It can be arrived at only by analysis of
+the algorithm in question.  The most that measurements can tell you is how the algorithm performs on
+a certain range of input sizes.
+
+
+@c ================================================================================
+@node The Common Lisp Object System
+@section The Common Lisp Object System
+
+This section is intended for readers unfamiliar with Common Lisp.  It is not a full treatment of
+CLOS, the Common Lisp Object System, but should provide enough background that you can understand
+the rest of this book.
+
+CLOS is unusual, among object-oriented languages, in several ways:
+
+@itemize
+@item
+Common Lisp was not designed from scratch as an object-oriented language; CLOS was added on to it
+relatively late in its evolution.  There were other OO extensions to Lisp that preceded it and
+influenced its design, notably Flavors on the MIT Lisp Machine and LOOPS in Xerox Interlisp-D.
+
+@item
+CLOS organizes functionality quite differently from most OO languages.  A class definition specifies
+only the class's data: its superclasses and slots (fields).  It does not specify the methods on the
+class.  Instead, @dfn{generic functions} abstract the notion of an operation that can be invoked on
+different classes; each method is associated with a generic function.
+
+Imagine a hierarchy of classes with methods in a mainstream OO language.  For each method, either it
+overrides a method of the same name in a superclass, or it does not; the latter we call root
+methods.  Consider a single root method and all the subclass methods that override it; that's the
+set of methods that forms a generic function.
+@item
+CLOS supports multiple dispatch.  Each method on a generic function has a list of @dfn{specializers}
+defining a list of parameter types on which the method is applicable.  Invocation of a generic
+function on a list of arguments (conceptually) scans the methods of the generic function, to find
+the method whose specializers best match the types of the arguments, then dispatches to that method.
+(A caching mechanism makes this much cheaper, in practice, than it sounds.)
+
+The language spec has a detailed definition of what ``best match'' means here, but the short version
+is that since there are subtyping relationships involved, we want a method whose specializers are
+more specific to shadow one whose specializers are less specific, when the arguments are of the more
+specific types.  In the single-dispatch case, this generates the familiar overriding behavior of
+other OO languages: a method on a subclass overrides one of the same name on a superclass.
+@item
+The classes available to be specialized on are not limited to those the user has defined; CL defines
+a hierarchy of built-in classes that can also be used.  The class named @code{t} is the top of the
+hierarchy, the class of all objects.  When no specializer is explicitly given for a parameter of a
+method, the specializer defaults to @code{t}.
+
+CLOS also provides a way to specialize a method parameter on a symbol, so that the method will be
+called only when that specific symbol is passed.  FSet uses this for its generic function
+@href{Generic Function @code{convert}, @code{convert}}, to specify the intended conversion.
+@end itemize
+
+Here's the first line of a sample entry from the API Reference chapter:
+
+@deffn Method {find-if (t set)} @ pred s @r{&key} key
+@end deffn
+
+Here @code{find-if} is the generic function, and @code{(t set)} is the list of specializers.  This
+method will be invoked on a call whose second argument is a set.  The required parameters are
+@var{pred} and @code{s}; @code{s} will be bound to the set.
+
+For brevity, I have usually omitted trailing @code{t} specializers in this book, since they have no
+effect on method selection.
+
+Oh, maybe I should say a little about optional and keyword parameters.  CL has both of these, marked
+in parameter lists by @code{&optional} and @code{&key} respectively.  Optional parameters match
+arguments by position; for keyword parameters, the argument must be preceded by the parameter name
+as a keyword symbol (@i{i.e.}, preceded by a colon).  Both optional and keyword parameters may be
+given default values in the parameter list; the default default is @code{nil}.  Examples:
+
+@example
+(defun foo (x &optional y (z 0)) ...)
+(defun bar (x &key y (z 3)) ...)
+;;; some possible calls
+(foo 17)             ; x = 17, y = nil, z = 0
+(foo 17 42)          ; x = 17, y = 42, z = 0
+(foo 17 42 19)       ; x = 17, y = 42, z = 19
+(bar 22)             ; x = 22, y = nil, z = 3
+(bar 22 :z 7)        ; x = 22, y = nil, z = 7
+(bar 22 :z 7 :y 13)  ; x = 22, y = 13, z = 7
+@end example
+
