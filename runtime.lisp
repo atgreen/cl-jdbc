@@ -1,6 +1,6 @@
 ;;;; runtime.lisp --- Bootstrapping OpenLDK and putting JDBC drivers on the classpath.
 ;;;;
-;;;; Copyright (C) 2026  Anthony Green <anthony@atgreen.org>
+;;;; Copyright (C) 2026  Anthony Green <green@moxielogic.com>
 ;;;; SPDX-License-Identifier: MIT
 ;;;;
 ;;;; The JDBC API itself (java.sql.*) is part of the JDK OpenLDK reads, so it

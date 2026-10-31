@@ -1,11 +1,11 @@
 ;;;; dbd-jdbc.asd --- A cl-dbi driver backed by JDBC through cl-jdbc.
 ;;;;
-;;;; Copyright (C) 2026  Anthony Green <anthony@atgreen.org>
+;;;; Copyright (C) 2026  Anthony Green <green@moxielogic.com>
 ;;;; SPDX-License-Identifier: MIT
 
 (asdf:defsystem "dbd-jdbc"
   :description "A cl-dbi (DBI) driver that reaches any database through its JDBC driver."
-  :author "Anthony Green <anthony@atgreen.org>"
+  :author "Anthony Green <green@moxielogic.com>"
   :license "MIT"
   :version "0.1.0"
   :depends-on ("cl-jdbc" "dbi")

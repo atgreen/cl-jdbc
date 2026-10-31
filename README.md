@@ -118,12 +118,18 @@ escaped by the driver rather than spliced into the SQL.
 
 ### Values
 
-Parameters map from Lisp to JDBC: `nil` → SQL `NULL`, `t` → boolean true, a
-string → varchar, an integer → bigint, a real → double; any other value is
-passed through as a Java object. Results map back: `NULL` → `nil`, strings →
-strings, booleans → `t`/`nil`, floating and decimal numbers → `double-float`,
-other numbers → integers. Values with no natural Lisp form (dates, timestamps,
-byte arrays) come back as their Java `toString` for now.
+Parameters map from Lisp to JDBC following the cl-postgres/Postmodern
+convention: `t` → boolean true, `nil` → boolean **false**, `:null` → SQL
+`NULL`, a string → varchar, an integer → bigint, a real → double; any other
+value is passed through as a Java object. Note that `nil` is false, not NULL —
+bind SQL `NULL` with the keyword `:null`.
+
+Results map back: `NULL` → `nil`, strings → strings, booleans → `t`/`nil`,
+floating and decimal numbers → `double-float`, other numbers → integers.
+(Reading is therefore slightly asymmetric: both SQL `NULL` and boolean false
+read back as `nil`, as they do in cl-postgres.) Values with no natural Lisp
+form (dates, timestamps, byte arrays) come back as their Java `toString` for
+now.
 
 ## As a cl-dbi driver
 

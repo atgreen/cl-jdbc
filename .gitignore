@@ -8,3 +8,7 @@
 .beads-credential-key
 .beads/proxieddb/
 *.gate.lock*
+
+# ocicl vendored dependencies (resolved on build, not committed)
+/ocicl/
+/ocicl.csv

@@ -1,6 +1,6 @@
 ;;;; tests/tests.lisp --- cl-jdbc test suite, run against an in-memory H2 database.
 ;;;;
-;;;; Copyright (C) 2026  Anthony Green <anthony@atgreen.org>
+;;;; Copyright (C) 2026  Anthony Green <green@moxielogic.com>
 ;;;; SPDX-License-Identifier: MIT
 
 (defpackage #:cl-jdbc/tests
@@ -53,24 +53,28 @@ USERS table of three rows, for the extent of BODY."
     (is (= 2 (jdbc:execute c "delete from users where age > 40")))  ; Grace 44, Alan 41
     (is (= 1 (jdbc:row-value (first (jdbc:query c "select count(*) c from users")) "c")))))
 
-(test null-round-trips
-  "NULL comes back as NIL, and NIL binds as SQL NULL."
+(test null-binds-with-the-null-keyword
+  ":NULL binds as SQL NULL and comes back as NIL (cl-postgres/Postmodern style)."
   (with-sample-db (c)
-    (jdbc:execute c "insert into users values (?, ?, ?, ?)" 4 "Nemo" nil nil)
+    (jdbc:execute c "insert into users values (?, ?, ?, ?)" 4 "Nemo" :null :null)
     (let ((row (first (jdbc:query c "select age, active from users where id = ?" 4))))
       (is (null (jdbc:row-value row "age")))
       (is (null (jdbc:row-value row "active"))))))
 
 (test lisp-types-round-trip
-  "Strings, integers, reals and booleans survive a round trip."
+  "Strings, integers, reals and booleans survive a round trip; T is true and
+NIL is boolean false."
   (with-sample-db (c)
-    (jdbc:execute c "create table t (s varchar, i bigint, d double, b boolean)")
-    (jdbc:execute c "insert into t values (?, ?, ?, ?)" "hi" 9000000000 3.5d0 t)
+    (jdbc:execute c "create table t (s varchar, i bigint, d double, yes boolean, no boolean)")
+    (jdbc:execute c "insert into t values (?, ?, ?, ?, ?)" "hi" 9000000000 3.5d0 t nil)
     (let ((row (first (jdbc:query c "select * from t"))))
       (is (string= "hi" (jdbc:row-value row "s")))
       (is (= 9000000000 (jdbc:row-value row "i")))
       (is (= 3.5d0 (jdbc:row-value row "d")))
-      (is (eq t (jdbc:row-value row "b"))))))
+      (is (eq t (jdbc:row-value row "yes")))
+      (is (eq nil (jdbc:row-value row "no"))))     ; NIL bound as false
+    ;; NIL is false, not NULL: it matches a false predicate.
+    (is (= 1 (jdbc:row-value (first (jdbc:query c "select count(*) c from t where no = ?" nil)) "c")))))
 
 (test transaction-commits-on-success
   "WITH-TRANSACTION commits changes when the body returns normally."

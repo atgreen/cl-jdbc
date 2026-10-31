@@ -1,6 +1,6 @@
 ;;;; dbd-jdbc.lisp --- A cl-dbi driver backed by JDBC through cl-jdbc.
 ;;;;
-;;;; Copyright (C) 2026  Anthony Green <anthony@atgreen.org>
+;;;; Copyright (C) 2026  Anthony Green <green@moxielogic.com>
 ;;;; SPDX-License-Identifier: MIT
 ;;;;
 ;;;; This makes every JDBC driver a cl-dbi backend.  Code written to the cl-dbi

@@ -1,20 +1,27 @@
 ;;;; types.lisp --- Converting values between Lisp and java.sql.
 ;;;;
-;;;; Copyright (C) 2026  Anthony Green <anthony@atgreen.org>
+;;;; Copyright (C) 2026  Anthony Green <green@moxielogic.com>
 ;;;; SPDX-License-Identifier: MIT
 
 (in-package #:cl-jdbc)
 
 (defun bind-parameter (statement index value)
   "Bind VALUE to parameter INDEX (1-based) of a PreparedStatement.  Lisp values
-map to JDBC setters: NIL -> SQL NULL, T -> boolean true, a string -> varchar,
-an integer -> bigint, a real -> double.  Anything else is passed through as a
-Java object (so a Java value obtained elsewhere can be bound directly)."
+map to JDBC setters, following the cl-postgres/Postmodern convention:
+  T      -> boolean true
+  NIL    -> boolean false
+  :NULL  -> SQL NULL
+  a string -> varchar, an integer -> bigint, a real -> double.
+Anything else is passed through as a Java object (so a Java value obtained
+elsewhere can be bound directly).  Note that NIL is false, not NULL: bind SQL
+NULL with the keyword :NULL."
   (cond
-    ((null value)
+    ((eq value :null)
      (java-call "setObject(ILjava/lang/Object;)V" statement index nil))
     ((eq value t)
      (java-call "setBoolean(IZ)V" statement index 1))
+    ((null value)
+     (java-call "setBoolean(IZ)V" statement index 0))
     ((stringp value)
      (java-call "setString(ILjava/lang/String;)V" statement index (jstring value)))
     ((integerp value)

@@ -1,6 +1,6 @@
 ;;;; statement.lisp --- Running SQL and reading result sets.
 ;;;;
-;;;; Copyright (C) 2026  Anthony Green <anthony@atgreen.org>
+;;;; Copyright (C) 2026  Anthony Green <green@moxielogic.com>
 ;;;; SPDX-License-Identifier: MIT
 
 (in-package #:cl-jdbc)

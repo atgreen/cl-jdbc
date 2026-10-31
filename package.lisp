@@ -1,6 +1,6 @@
 ;;;; package.lisp --- Package definition for cl-jdbc.
 ;;;;
-;;;; Copyright (C) 2026  Anthony Green <anthony@atgreen.org>
+;;;; Copyright (C) 2026  Anthony Green <green@moxielogic.com>
 ;;;; SPDX-License-Identifier: MIT
 
 (defpackage #:cl-jdbc

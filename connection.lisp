@@ -1,6 +1,6 @@
 ;;;; connection.lisp --- Opening, closing, and transacting on connections.
 ;;;;
-;;;; Copyright (C) 2026  Anthony Green <anthony@atgreen.org>
+;;;; Copyright (C) 2026  Anthony Green <green@moxielogic.com>
 ;;;; SPDX-License-Identifier: MIT
 
 (in-package #:cl-jdbc)
