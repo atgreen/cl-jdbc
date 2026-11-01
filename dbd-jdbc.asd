@@ -7,7 +7,7 @@
   :description "A cl-dbi (DBI) driver that reaches any database through its JDBC driver."
   :author "Anthony Green <green@moxielogic.com>"
   :license "MIT"
-  :version "0.1.0"
+  :version "1.0.0"
   :depends-on ("cl-jdbc" "dbi")
   :serial t
   :components ((:file "dbd-jdbc"))

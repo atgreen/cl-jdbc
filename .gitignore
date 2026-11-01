@@ -12,3 +12,6 @@
 # ocicl vendored dependencies (resolved on build, not committed)
 /ocicl/
 /ocicl.csv
+
+# locally generated SBOM (produced in CI, attached to the release)
+/cl-jdbc-sbom.cdx.json
